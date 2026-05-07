@@ -11,7 +11,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 # CRITICAL: Enables your web UI to fetch data from this API
-CORS(app)
+CORS(app, max_age=86400)
 
 PORT = int(os.environ.get("PORT", 3000))
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://username:password@localhost:5432/your_database")
