@@ -31,7 +31,7 @@ def refresh_questrade_token():
         # Fetch the token from Postgres
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT value FROM system_secrets WHERE key = 'QT_PAPP'")
+        cur.execute("SELECT value FROM system_secrets WHERE key = 'qt_refresh_token'")
         result = cur.fetchone()
         
         if not result:
