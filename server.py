@@ -178,7 +178,8 @@ def get_ibkr_positions():
         IB_GATEWAY_URL = 'https://localhost:5000/v1/api'
         
         # Get portfolio accounts (verify=False ignores the local self-signed cert warning)
-        acct_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/accounts", verify=False)
+        # ADDED timeout=2 so it instantly skips if the gateway isn't running
+        acct_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/accounts", verify=False, timeout=1)
         acct_res.raise_for_status()
         accounts = acct_res.json()
         
@@ -188,7 +189,7 @@ def get_ibkr_positions():
         account_id = accounts[0]['id']
 
         # Get positions for the account
-        pos_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/{account_id}/positions", verify=False)
+        pos_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/{account_id}/positions", verify=False, timeout=2)
         pos_res.raise_for_status()
 
         # Map to our Dashboard format
@@ -202,8 +203,8 @@ def get_ibkr_positions():
             
         return positions
 
-    except requests.exceptions.ConnectionError:
-        # Suppress IBKR errors if the gateway isn't running so it doesn't spam the console
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        # Suppress IBKR errors if the gateway isn't running or times out
         return []
     except Exception as e:
         print(f"IBKR Error: {e}")
@@ -213,7 +214,8 @@ def get_ibkr_balances():
     try:
         IB_GATEWAY_URL = 'https://localhost:5000/v1/api'
         
-        acct_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/accounts", verify=False)
+        # ADDED timeout=2
+        acct_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/accounts", verify=False, timeout=2)
         acct_res.raise_for_status()
         accounts = acct_res.json()
         
@@ -223,7 +225,7 @@ def get_ibkr_balances():
         account_id = accounts[0]['id']
 
         # Get balance summary for the account
-        bal_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/{account_id}/summary", verify=False)
+        bal_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/{account_id}/summary", verify=False, timeout=2)
         bal_res.raise_for_status()
         summary = bal_res.json()
 
@@ -232,7 +234,7 @@ def get_ibkr_balances():
             'buyingPower': summary.get('buyingpower', {}).get('amount', 0)
         }
 
-    except requests.exceptions.ConnectionError:
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
         return {'cash': 0, 'buyingPower': 0}
     except Exception as e:
         print(f"IBKR Balances Error: {e}")
