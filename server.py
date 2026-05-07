@@ -275,7 +275,11 @@ def positions():
                     'avgPrice': data['avgPrice']
                 })
 
-        return jsonify(final_array)
+        return jsonify({
+            "questrade": qt_positions,
+            "ibkr": ibkr_positions,
+            "total": final_array
+        })
 
     except Exception as e:
         print(f"Error generating positions: {e}")
