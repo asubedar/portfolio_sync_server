@@ -125,6 +125,50 @@ def get_questrade_positions(is_retry=False):
         print(f"❌ Questrade Error: {e}")
         return []
 
+def get_questrade_balances(is_retry=False):
+    global qt_access_token, qt_api_server
+    
+    if not qt_access_token:
+        if not refresh_questrade_token():
+            return {'cash': 0, 'buyingPower': 0}
+
+    try:
+        headers = {'Authorization': f'Bearer {qt_access_token}'}
+        
+        # 1. Get Accounts
+        acct_res = requests.get(f"{qt_api_server}v1/accounts", headers=headers)
+        acct_res.raise_for_status()
+        accounts = acct_res.json().get('accounts', [])
+        
+        if not accounts: 
+            return {'cash': 0, 'buyingPower': 0}
+            
+        account_id = accounts[0]['number']
+
+        # 2. Get Balances
+        bal_res = requests.get(f"{qt_api_server}v1/accounts/{account_id}/balances", headers=headers)
+        bal_res.raise_for_status()
+
+        # Questrade returns arrays of balances. Let's grab the combined USD balance.
+        combined = bal_res.json().get('combinedBalances', [])
+        target_bal = next((b for b in combined if b.get('currency') == 'USD'), combined[0] if combined else {})
+
+        return {
+            'cash': target_bal.get('cash', 0),
+            'buyingPower': target_bal.get('buyingPower', 0)
+        }
+
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 401 and not is_retry:
+            qt_access_token = '' 
+            return get_questrade_balances(is_retry=True)
+            
+        print(f"❌ Questrade Error fetching balances: {e}")
+        return {'cash': 0, 'buyingPower': 0}
+    except Exception as e:
+        print(f"❌ Questrade Error: {e}")
+        return {'cash': 0, 'buyingPower': 0}
+
 # ---------------------------------------------------------
 # 2. INTERACTIVE BROKERS (IBKR) INTEGRATION
 # ---------------------------------------------------------
@@ -163,6 +207,35 @@ def get_ibkr_positions():
     except Exception as e:
         print(f"IBKR Error: {e}")
         return []
+
+def get_ibkr_balances():
+    try:
+        IB_GATEWAY_URL = 'https://localhost:5000/v1/api'
+        
+        acct_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/accounts", verify=False)
+        acct_res.raise_for_status()
+        accounts = acct_res.json()
+        
+        if not accounts: 
+            return {'cash': 0, 'buyingPower': 0}
+            
+        account_id = accounts[0]['id']
+
+        # Get balance summary for the account
+        bal_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/{account_id}/summary", verify=False)
+        bal_res.raise_for_status()
+        summary = bal_res.json()
+
+        return {
+            'cash': summary.get('totalcashvalue', {}).get('amount', 0),
+            'buyingPower': summary.get('buyingpower', {}).get('amount', 0)
+        }
+
+    except requests.exceptions.ConnectionError:
+        return {'cash': 0, 'buyingPower': 0}
+    except Exception as e:
+        print(f"IBKR Balances Error: {e}")
+        return {'cash': 0, 'buyingPower': 0}
 
 # ---------------------------------------------------------
 # 3. MERGE & SERVE
@@ -208,8 +281,32 @@ def positions():
         print(f"Error generating positions: {e}")
         return jsonify({"error": "Failed to generate positions"}), 500
 
+@app.route('/balances.json', methods=['GET'])
+def balances():
+    try:
+        # Fetch from both brokers
+        qt_bal = get_questrade_balances()
+        ib_bal = get_ibkr_balances()
+
+        # Calculate totals
+        total_cash = qt_bal['cash'] + ib_bal['cash']
+        total_bp = qt_bal['buyingPower'] + ib_bal['buyingPower']
+
+        return jsonify({
+            "questrade": qt_bal,
+            "ibkr": ib_bal,
+            "total": {
+                "cash": total_cash,
+                "buyingPower": total_bp
+            }
+        })
+
+    except Exception as e:
+        print(f"Error generating balances: {e}")
+        return jsonify({"error": "Failed to generate balances"}), 500
 
 if __name__ == '__main__':
     print(f"🚀 Portfolio Sync Server running at http://localhost:{PORT}")
     print(f"🔗 Set your dashboard Sync URL to: http://localhost:{PORT}/positions.json")
+    print(f"🔗 Check live balances at: http://localhost:{PORT}/balances.json")
     app.run(host='0.0.0.0', port=PORT)
