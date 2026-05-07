@@ -4,6 +4,7 @@ import psycopg2
 from flask import Flask, jsonify
 from flask_cors import CORS
 import urllib3
+import concurrent.futures # NEW: Added for concurrent requests
 
 # Suppress insecure request warnings for IBKR local gateway's self-signed cert
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -243,9 +244,13 @@ def get_ibkr_balances():
 @app.route('/positions.json', methods=['GET'])
 def positions():
     try:
-        # Fetch from both brokers
-        qt_positions = get_questrade_positions()
-        ibkr_positions = get_ibkr_positions()
+        # NEW: Fetch from both brokers concurrently instead of waiting for one to finish
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            qt_future = executor.submit(get_questrade_positions)
+            ibkr_future = executor.submit(get_ibkr_positions)
+            
+            qt_positions = qt_future.result()
+            ibkr_positions = ibkr_future.result()
 
         all_positions = qt_positions + ibkr_positions
 
@@ -288,9 +293,13 @@ def positions():
 @app.route('/balances.json', methods=['GET'])
 def balances():
     try:
-        # Fetch from both brokers
-        qt_bal = get_questrade_balances()
-        ib_bal = get_ibkr_balances()
+        # NEW: Fetch balances concurrently
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            qt_future = executor.submit(get_questrade_balances)
+            ibkr_future = executor.submit(get_ibkr_balances)
+            
+            qt_bal = qt_future.result()
+            ib_bal = ibkr_future.result()
 
         # Calculate totals
         total_cash = qt_bal['cash'] + ib_bal['cash']
