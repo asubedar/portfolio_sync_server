@@ -177,44 +177,48 @@ def get_ibkr_positions():
     try:
         IB_GATEWAY_URL = 'https://localhost:5000/v1/api'
         
-        # Get portfolio accounts (verify=False ignores the local self-signed cert warning)
-        # ADDED timeout=2 so it instantly skips if the gateway isn't running
-        acct_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/accounts", verify=False, timeout=1)
+        # Get portfolio accounts
+        acct_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/accounts", verify=False, timeout=2)
         acct_res.raise_for_status()
         accounts = acct_res.json()
         
         if not accounts: 
             return []
             
-        account_id = accounts[0]['id']
+        all_positions = []
 
-        # Get positions for the account
-        pos_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/{account_id}/positions", verify=False, timeout=2)
-        pos_res.raise_for_status()
-
-        # Map to our Dashboard format
-        positions = []
-        for p in pos_res.json():
-            positions.append({
-                'symbol': p['contractDesc'], 
-                'qty': p['position'],
-                'avgPrice': p['avgCost']
-            })
+        # Loop through EVERY account returned by IBKR
+        for account in accounts:
+            account_id = account.get('id') or account.get('accountId')
             
-        return positions
+            try:
+                # Note: IBKR API usually expects a page number at the end for positions (e.g., /positions/0)
+                pos_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/{account_id}/positions/0", verify=False, timeout=2)
+                pos_res.raise_for_status()
+
+                # Map to our Dashboard format and append to master list
+                for p in pos_res.json():
+                    all_positions.append({
+                        'symbol': p.get('contractDesc', ''), 
+                        'qty': float(p.get('position', 0)),
+                        'avgPrice': float(p.get('avgCost', 0))
+                    })
+            except Exception as e:
+                print(f"⚠️ IBKR Error fetching positions for account {account_id}: {e}")
+                continue # If one account fails, skip it and keep fetching the others
+                
+        return all_positions
 
     except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-        # Suppress IBKR errors if the gateway isn't running or times out
         return []
     except Exception as e:
-        print(f"IBKR Error: {e}")
+        print(f"❌ IBKR Critical Error: {e}")
         return []
 
 def get_ibkr_balances():
     try:
         IB_GATEWAY_URL = 'https://localhost:5000/v1/api'
         
-        # ADDED timeout=2
         acct_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/accounts", verify=False, timeout=2)
         acct_res.raise_for_status()
         accounts = acct_res.json()
@@ -222,22 +226,36 @@ def get_ibkr_balances():
         if not accounts: 
             return {'cash': 0, 'buyingPower': 0}
             
-        account_id = accounts[0]['id']
+        total_cash = 0.0
+        total_bp = 0.0
 
-        # Get balance summary for the account
-        bal_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/{account_id}/summary", verify=False, timeout=2)
-        bal_res.raise_for_status()
-        summary = bal_res.json()
+        # Loop through EVERY account to sum the balances
+        for account in accounts:
+            account_id = account.get('id') or account.get('accountId')
+            
+            try:
+                # Get balance summary for this specific account
+                bal_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/{account_id}/summary", verify=False, timeout=2)
+                bal_res.raise_for_status()
+                summary = bal_res.json()
+
+                # Safely extract and add to running totals
+                total_cash += float(summary.get('totalcashvalue', {}).get('amount', 0))
+                total_bp += float(summary.get('buyingpower', {}).get('amount', 0))
+                
+            except Exception as e:
+                print(f"⚠️ IBKR Error fetching balances for account {account_id}: {e}")
+                continue
 
         return {
-            'cash': summary.get('totalcashvalue', {}).get('amount', 0),
-            'buyingPower': summary.get('buyingpower', {}).get('amount', 0)
+            'cash': total_cash,
+            'buyingPower': total_bp
         }
 
     except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
         return {'cash': 0, 'buyingPower': 0}
     except Exception as e:
-        print(f"IBKR Balances Error: {e}")
+        print(f"❌ IBKR Balances Critical Error: {e}")
         return {'cash': 0, 'buyingPower': 0}
 
 # ---------------------------------------------------------
