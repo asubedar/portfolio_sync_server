@@ -156,7 +156,8 @@ def get_questrade_balances(is_retry=False):
 
         return {
             'cash': target_bal.get('cash', 0),
-            'buyingPower': target_bal.get('buyingPower', 0)
+            'buyingPower': target_bal.get('buyingPower', 0),
+            'equity': target_bal.get('totalEquity', 0)
         }
 
     except requests.exceptions.HTTPError as e:
@@ -228,6 +229,7 @@ def get_ibkr_balances():
             
         total_cash = 0.0
         total_bp = 0.0
+        total_equity = 0.0
 
         # Loop through EVERY account to sum the balances
         for account in accounts:
@@ -242,6 +244,7 @@ def get_ibkr_balances():
                 # Safely extract and add to running totals
                 total_cash += float(summary.get('totalcashvalue', {}).get('amount', 0))
                 total_bp += float(summary.get('buyingpower', {}).get('amount', 0))
+                total_equity += float(summary.get('netliquidation', {}).get('amount', 0))
                 
             except Exception as e:
                 print(f"⚠️ IBKR Error fetching balances for account {account_id}: {e}")
@@ -249,7 +252,8 @@ def get_ibkr_balances():
 
         return {
             'cash': total_cash,
-            'buyingPower': total_bp
+            'buyingPower': total_bp,
+            'equity': total_equity
         }
 
     except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
@@ -337,6 +341,36 @@ def balances():
     except Exception as e:
         print(f"Error generating balances: {e}")
         return jsonify({"error": "Failed to generate balances"}), 500
+
+@app.route('/equity.json', methods=['GET'])
+def equity():
+    try:
+        # Fetch data concurrently
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            qt_future = executor.submit(get_questrade_balances)
+            ibkr_future = executor.submit(get_ibkr_balances)
+            
+            qt_data = qt_future.result()
+            ib_data = ibkr_future.result()
+
+        # Calculate total combined equity
+        total_equity = qt_data['equity'] + ib_data['equity']
+
+        return jsonify({
+            "questrade": {
+                "equity": qt_data['equity']
+            },
+            "ibkr": {
+                "equity": ib_data['equity']
+            },
+            "total": {
+                "equity": total_equity
+            }
+        })
+
+    except Exception as e:
+        print(f"Error generating equity: {e}")
+        return jsonify({"error": "Failed to generate equity"}), 500
 
 if __name__ == '__main__':
     print(f"🚀 Portfolio Sync Server running at http://localhost:{PORT}")
