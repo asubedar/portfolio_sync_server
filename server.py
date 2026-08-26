@@ -1,20 +1,29 @@
 import os
+import time
 import requests
 import psycopg2
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 import urllib3
-import concurrent.futures # NEW: Added for concurrent requests
+import concurrent.futures
 
-# Suppress insecure request warnings for IBKR local gateway's self-signed cert
+# NEW: Alpaca routing dependencies
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import LimitOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
-# CRITICAL: Enables your web UI to fetch data from this API
 CORS(app, max_age=86400)
 
 PORT = int(os.environ.get("PORT", 3000))
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://username:password@localhost:5432/your_database")
+
+# Initialize Alpaca Client securely on the SERVER
+ALPACA_KEY = os.environ.get("ALPACA_API_KEY")
+ALPACA_SECRET = os.environ.get("ALPACA_SECRET_KEY")
+alpaca_client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True) if ALPACA_KEY else None
 
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
