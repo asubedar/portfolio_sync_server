@@ -406,78 +406,94 @@ def networth_csv():
         # Return 0 if there's an error so it doesn't break your spreadsheet math
         return app.response_class(response="0", status=500, mimetype='text/plain')
 
-# ---------------------------------------------------------
-# 4. EXECUTION GATEWAY (Order Management System)
-# ---------------------------------------------------------
 @app.route('/api/order', methods=['POST'])
 def place_order():
     """
-    Receives trade commands from distributed AI agents over Tailscale.
-    Enforces Global Risk Limits, then routes to IBKR.
+    Receives trade commands from distributed AI agents.
+    Routes to Shadow, Alpaca, or IBKR based on the payload.
     """
     data = request.json
+    broker = data.get('broker', 'shadow').lower()
     ticker = data.get('ticker')
-    side = data.get('side', '').upper() # 'BUY' or 'SELL'
+    side = data.get('side', '').upper()
     qty = float(data.get('qty', 0))
     limit_price = float(data.get('limit_price', 0))
     agent_id = data.get('agent_id', 'unknown_agent')
 
     if not all([ticker, side, qty, limit_price]):
-        return jsonify({"status": "error", "message": "Missing required order parameters"}), 400
+        return jsonify({"status": "error", "message": "Missing required parameters"}), 400
 
-    print(f"\n[OMS] 🚦 RECEIVED ORDER FROM {agent_id.upper()}: {side} {qty} {ticker} @ ${limit_price}")
+    print(f"\n[OMS] 🚦 RECEIVED ORDER FROM {agent_id.upper()}: {side} {qty} {ticker} @ ${limit_price:.2f} -> DEST: {broker.upper()}")
 
-    # --- 1. GLOBAL RISK MANAGEMENT (The Circuit Breaker) ---
-    balances = get_ibkr_balances()
-    current_bp = balances.get('buyingPower', 0)
-    
-    if side == 'BUY':
-        estimated_cost = qty * limit_price
-        # Leave a $2,000 global safety buffer so margin never gets completely maxed out
-        if estimated_cost > (current_bp - 2000):
-            print(f"[OMS] ❌ REJECTED: Insufficient Global Buying Power. Cost: ${estimated_cost:.2f} | BP: ${current_bp:.2f}")
-            return jsonify({"status": "rejected", "reason": "GLOBAL_MARGIN_LIMIT"}), 403
+    # ==========================================
+    # ROUTE 1: SHADOW MODE (Paper simulation without API)
+    # ==========================================
+    if broker == 'shadow':
+        print(f"[OMS] 👻 SHADOW EXECUTION LOGGED: {side} {ticker}. No broker API invoked.")
+        return jsonify({"status": "success", "broker": "shadow", "message": "Shadow order acknowledged."}), 200
 
-    # --- 2. IBKR ROUTING (Client Portal API) ---
-    try:
-        IB_GATEWAY_URL = 'https://localhost:5000/v1/api'
-        
-        # 1. Get Account ID (Requires 1 call, or cache this in a global variable!)
-        acct_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/accounts", verify=False, timeout=2)
-        accounts = acct_res.json()
-        account_id = accounts[0].get('id') or accounts[0].get('accountId')
+    # ==========================================
+    # ROUTE 2: ALPACA 
+    # ==========================================
+    elif broker == 'alpaca':
+        if not alpaca_client:
+            print("[OMS] ❌ REJECTED: Alpaca API keys not configured on Gateway.")
+            return jsonify({"status": "error", "message": "Alpaca not configured"}), 500
+            
+        try:
+            order_side = OrderSide.BUY if side == 'BUY' else OrderSide.SELL
+            limit_order = LimitOrderRequest(
+                symbol=ticker, 
+                qty=qty, 
+                side=order_side, 
+                time_in_force=TimeInForce.DAY,
+                limit_price=round(limit_price, 2),
+                extended_hours=True
+            )
+            order = alpaca_client.submit_order(order_data=limit_order)
+            print(f"[OMS] 🦙 ALPACA ORDER SUBMITTED: ID {order.id}")
+            
+            return jsonify({"status": "success", "broker": "alpaca", "order_id": str(order.id)}), 200
+            
+        except Exception as e:
+            print(f"[OMS] ❌ ALPACA ROUTING FAILED: {e}")
+            return jsonify({"status": "error", "message": str(e)}), 500
 
-        # 2. Format the IBKR JSON Payload
-        # (Note: You may need to ping /v1/api/iserver/secdef/search to get the exact conid for the ticker first)
-        ibkr_payload = {
-            "orders": [{
-                "cOID": f"{agent_id}_{int(time.time())}", # Tag order with the AI agent's name
-                "ticker": ticker,
-                "orderType": "LMT",
-                "price": limit_price,
-                "side": side,
-                "quantity": qty,
-                "tif": "DAY",
-                "outsideRTH": True
-            }]
-        }
+    # ==========================================
+    # ROUTE 3: INTERACTIVE BROKERS
+    # ==========================================
+    elif broker == 'ibkr':
+        try:
+            IB_GATEWAY_URL = 'https://localhost:5000/v1/api'
+            acct_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/accounts", verify=False, timeout=2)
+            accounts = acct_res.json()
+            account_id = accounts[0].get('id') or accounts[0].get('accountId')
 
-        # 3. Submit to IBKR
-        order_res = requests.post(f"{IB_GATEWAY_URL}/iserver/account/{account_id}/orders", json=ibkr_payload, verify=False, timeout=2)
-        order_res.raise_for_status()
-        
-        reply = order_res.json()
-        print(f"[OMS] ✅ ORDER ROUTED TO IBKR SUCCESSFULLY: {reply}")
-        
-        return jsonify({
-            "status": "success", 
-            "broker_response": reply,
-            "global_bp_remaining": current_bp - estimated_cost if side == 'BUY' else current_bp
-        }), 200
+            ibkr_payload = {
+                "orders": [{
+                    "cOID": f"{agent_id}_{int(time.time())}", 
+                    "ticker": ticker,
+                    "orderType": "LMT",
+                    "price": round(limit_price, 2),
+                    "side": side,
+                    "quantity": qty,
+                    "tif": "DAY",
+                    "outsideRTH": True
+                }]
+            }
 
-    except Exception as e:
-        print(f"[OMS] ❌ IBKR ROUTING FAILED: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+            order_res = requests.post(f"{IB_GATEWAY_URL}/iserver/account/{account_id}/orders", json=ibkr_payload, verify=False, timeout=2)
+            order_res.raise_for_status()
+            
+            print(f"[OMS] ✅ IBKR ORDER SUBMITTED: {order_res.json()}")
+            return jsonify({"status": "success", "broker": "ibkr", "response": order_res.json()}), 200
+
+        except Exception as e:
+            print(f"[OMS] ❌ IBKR ROUTING FAILED: {e}")
+            return jsonify({"status": "error", "message": str(e)}), 500
+            
+    else:
+        return jsonify({"status": "error", "message": f"Unknown broker target: {broker}"}), 400
 
 if __name__ == '__main__':
     print(f"🚀 Portfolio Sync Server running at http://localhost:{PORT}")
