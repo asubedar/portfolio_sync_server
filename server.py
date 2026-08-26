@@ -2,10 +2,12 @@ import os
 import time
 import requests
 import psycopg2
+from functools import wraps
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import urllib3
 import concurrent.futures
+from vault import load_secrets
 
 # NEW: Alpaca routing dependencies
 from alpaca.trading.client import TradingClient
@@ -17,8 +19,12 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
 CORS(app, max_age=86400)
 
+load_secrets()
+
 PORT = int(os.environ.get("PORT", 3000))
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://username:password@localhost:5432/your_database")
+
+GATEWAY_API_KEY = os.environ.get("GATEWAY_API_KEY")
 
 # Initialize Alpaca Client securely on the SERVER
 ALPACA_KEY = os.environ.get("ALPACA_API_KEY")
@@ -27,6 +33,21 @@ alpaca_client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True) if ALPACA_K
 
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
+
+def require_apikey(f):
+    """
+    Flask decorator to enforce Gateway API Key authorization.
+    """
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        provided_key = request.headers.get('X-Gateway-Token')
+        if not provided_key or provided_key != GATEWAY_API_KEY:
+            print(f"[OMS] 🚨 UNAUTHORIZED ATTEMPT BLOCKED FROM IP: {request.remote_addr} | Target: {request.path}")
+            return jsonify({"status": "error", "message": "Unauthorized. Invalid Gateway Token."}), 401
+        
+        # If the key matches, execute the original route function
+        return f(*args, **kwargs)
+    return decorated_function
 
 # ---------------------------------------------------------
 # 1. QUESTRADE INTEGRATION (Full OAuth Lifecycle)
@@ -407,6 +428,7 @@ def networth_csv():
         return app.response_class(response="0", status=500, mimetype='text/plain')
 
 @app.route('/api/order', methods=['POST'])
+@require_apikey   # <--- THE MAGIC LOCK
 def place_order():
     """
     Receives trade commands from distributed AI agents.
