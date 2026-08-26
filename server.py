@@ -9,14 +9,16 @@ import urllib3
 import concurrent.futures
 from vault import load_secrets
 
-# NEW: Alpaca routing dependencies
+# Alpaca routing dependencies
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import LimitOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import LimitOrderRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 
+# Suppress insecure request warnings for IBKR local gateway's self-signed cert
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
+# CRITICAL: Enables your web UI to fetch data from this API
 CORS(app, max_age=86400)
 
 load_secrets()
@@ -24,7 +26,11 @@ load_secrets()
 PORT = int(os.environ.get("PORT", 3000))
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://username:password@localhost:5432/your_database")
 
-GATEWAY_API_KEY = os.environ.get("GATEWAY_API_KEY")
+# ==========================================
+# GATEWAY SECURITY & GLOBAL STATE
+# ==========================================
+GATEWAY_API_KEY = os.environ.get("GATEWAY_API_KEY", "your_super_secret_tailnet_key_2026")
+GLOBAL_TRADING_HALTED = False
 
 # Initialize Alpaca Client securely on the SERVER
 ALPACA_KEY = os.environ.get("ALPACA_API_KEY")
@@ -36,7 +42,7 @@ def get_db_connection():
 
 def require_apikey(f):
     """
-    Flask decorator to enforce Gateway API Key authorization.
+    Flask decorator to enforce Gateway API Key authorization over the Tailnet.
     """
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -44,22 +50,19 @@ def require_apikey(f):
         if not provided_key or provided_key != GATEWAY_API_KEY:
             print(f"[OMS] 🚨 UNAUTHORIZED ATTEMPT BLOCKED FROM IP: {request.remote_addr} | Target: {request.path}")
             return jsonify({"status": "error", "message": "Unauthorized. Invalid Gateway Token."}), 401
-        
-        # If the key matches, execute the original route function
         return f(*args, **kwargs)
     return decorated_function
 
-# ---------------------------------------------------------
+
+# =========================================================
 # 1. QUESTRADE INTEGRATION (Full OAuth Lifecycle)
-# ---------------------------------------------------------
+# =========================================================
 qt_access_token = ''
 qt_api_server = ''
 
 def refresh_questrade_token():
     global qt_access_token, qt_api_server
-    
     try:
-        # Fetch the token from Postgres
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("SELECT value FROM system_secrets WHERE key = 'qt_refresh_token'")
@@ -72,7 +75,6 @@ def refresh_questrade_token():
             return False
             
         refresh_token = result[0]
-
         print("🔄 Exchanging Questrade refresh token...")
         url = f"https://login.questrade.com/oauth2/token?grant_type=refresh_token&refresh_token={refresh_token}"
         
@@ -80,11 +82,9 @@ def refresh_questrade_token():
         response.raise_for_status() 
         data = response.json()
 
-        # Store the temporary access token and unique server URL in memory
         qt_access_token = data['access_token']
         qt_api_server = data['api_server']
 
-        # CRITICAL: Save the NEW refresh token back to Postgres
         new_refresh_token = data['refresh_token']
         cur.execute("""
             INSERT INTO system_secrets (key, value) 
@@ -109,30 +109,22 @@ def refresh_questrade_token():
 
 def get_questrade_positions(is_retry=False):
     global qt_access_token, qt_api_server
-    
-    # If we don't have an access token in memory, get one
     if not qt_access_token:
         if not refresh_questrade_token():
             return []
 
     try:
         headers = {'Authorization': f'Bearer {qt_access_token}'}
-        
-        # 1. Get Accounts
         acct_res = requests.get(f"{qt_api_server}v1/accounts", headers=headers)
         acct_res.raise_for_status()
         accounts = acct_res.json().get('accounts', [])
         
-        if not accounts: 
-            return []
-            
+        if not accounts: return []
         account_id = accounts[0]['number']
 
-        # 2. Get Positions
         pos_res = requests.get(f"{qt_api_server}v1/accounts/{account_id}/positions", headers=headers)
         pos_res.raise_for_status()
 
-        # 3. Map to Dashboard format
         positions = []
         for p in pos_res.json().get('positions', []):
             positions.append({
@@ -140,16 +132,13 @@ def get_questrade_positions(is_retry=False):
                 'qty': p['openQuantity'],
                 'avgPrice': p['averageEntryPrice']
             })
-            
         return positions
 
     except requests.exceptions.HTTPError as e:
-        # If the token expired during the request, catch the 401, refresh, and retry exactly once
         if e.response.status_code == 401 and not is_retry:
             print("⚠️ Questrade token expired during request. Refreshing and retrying...")
-            qt_access_token = '' # Force a refresh
+            qt_access_token = '' 
             return get_questrade_positions(is_retry=True)
-            
         print(f"❌ Questrade Error fetching positions: {e}")
         return []
     except Exception as e:
@@ -158,29 +147,22 @@ def get_questrade_positions(is_retry=False):
 
 def get_questrade_balances(is_retry=False):
     global qt_access_token, qt_api_server
-    
     if not qt_access_token:
         if not refresh_questrade_token():
-            return {'cash': 0, 'buyingPower': 0}
+            return {'cash': 0, 'buyingPower': 0, 'equity': 0}
 
     try:
         headers = {'Authorization': f'Bearer {qt_access_token}'}
-        
-        # 1. Get Accounts
         acct_res = requests.get(f"{qt_api_server}v1/accounts", headers=headers)
         acct_res.raise_for_status()
         accounts = acct_res.json().get('accounts', [])
         
-        if not accounts: 
-            return {'cash': 0, 'buyingPower': 0}
-            
+        if not accounts: return {'cash': 0, 'buyingPower': 0, 'equity': 0}
         account_id = accounts[0]['number']
 
-        # 2. Get Balances
         bal_res = requests.get(f"{qt_api_server}v1/accounts/{account_id}/balances", headers=headers)
         bal_res.raise_for_status()
 
-        # Questrade returns arrays of balances. Let's grab the combined USD balance.
         combined = bal_res.json().get('combinedBalances', [])
         target_bal = next((b for b in combined if b.get('currency') == 'USD'), combined[0] if combined else {})
 
@@ -194,40 +176,31 @@ def get_questrade_balances(is_retry=False):
         if e.response.status_code == 401 and not is_retry:
             qt_access_token = '' 
             return get_questrade_balances(is_retry=True)
-            
         print(f"❌ Questrade Error fetching balances: {e}")
-        return {'cash': 0, 'buyingPower': 0}
+        return {'cash': 0, 'buyingPower': 0, 'equity': 0}
     except Exception as e:
         print(f"❌ Questrade Error: {e}")
-        return {'cash': 0, 'buyingPower': 0}
+        return {'cash': 0, 'buyingPower': 0, 'equity': 0}
 
-# ---------------------------------------------------------
+
+# =========================================================
 # 2. INTERACTIVE BROKERS (IBKR) INTEGRATION
-# ---------------------------------------------------------
+# =========================================================
 def get_ibkr_positions():
     try:
         IB_GATEWAY_URL = 'https://localhost:5000/v1/api'
-        
-        # Get portfolio accounts
         acct_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/accounts", verify=False, timeout=2)
         acct_res.raise_for_status()
         accounts = acct_res.json()
         
-        if not accounts: 
-            return []
-            
+        if not accounts: return []
         all_positions = []
 
-        # Loop through EVERY account returned by IBKR
         for account in accounts:
             account_id = account.get('id') or account.get('accountId')
-            
             try:
-                # Note: IBKR API usually expects a page number at the end for positions (e.g., /positions/0)
                 pos_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/{account_id}/positions/0", verify=False, timeout=2)
                 pos_res.raise_for_status()
-
-                # Map to our Dashboard format and append to master list
                 for p in pos_res.json():
                     all_positions.append({
                         'symbol': p.get('contractDesc', ''), 
@@ -236,7 +209,7 @@ def get_ibkr_positions():
                     })
             except Exception as e:
                 print(f"⚠️ IBKR Error fetching positions for account {account_id}: {e}")
-                continue # If one account fails, skip it and keep fetching the others
+                continue 
                 
         return all_positions
 
@@ -249,33 +222,26 @@ def get_ibkr_positions():
 def get_ibkr_balances():
     try:
         IB_GATEWAY_URL = 'https://localhost:5000/v1/api'
-        
         acct_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/accounts", verify=False, timeout=2)
         acct_res.raise_for_status()
         accounts = acct_res.json()
         
-        if not accounts: 
-            return {'cash': 0, 'buyingPower': 0}
+        if not accounts: return {'cash': 0, 'buyingPower': 0, 'equity': 0}
             
         total_cash = 0.0
         total_bp = 0.0
         total_equity = 0.0
 
-        # Loop through EVERY account to sum the balances
         for account in accounts:
             account_id = account.get('id') or account.get('accountId')
-            
             try:
-                # Get balance summary for this specific account
                 bal_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/{account_id}/summary", verify=False, timeout=2)
                 bal_res.raise_for_status()
                 summary = bal_res.json()
 
-                # Safely extract and add to running totals
                 total_cash += float(summary.get('totalcashvalue', {}).get('amount', 0))
                 total_bp += float(summary.get('buyingpower', {}).get('amount', 0))
                 total_equity += float(summary.get('netliquidation', {}).get('amount', 0))
-                
             except Exception as e:
                 print(f"⚠️ IBKR Error fetching balances for account {account_id}: {e}")
                 continue
@@ -287,18 +253,18 @@ def get_ibkr_balances():
         }
 
     except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-        return {'cash': 0, 'buyingPower': 0}
+        return {'cash': 0, 'buyingPower': 0, 'equity': 0}
     except Exception as e:
         print(f"❌ IBKR Balances Critical Error: {e}")
-        return {'cash': 0, 'buyingPower': 0}
+        return {'cash': 0, 'buyingPower': 0, 'equity': 0}
 
-# ---------------------------------------------------------
-# 3. MERGE & SERVE
-# ---------------------------------------------------------
+
+# =========================================================
+# 3. READ-ONLY SYNC ROUTES (Dashboards & Spreadsheets)
+# =========================================================
 @app.route('/positions.json', methods=['GET'])
 def positions():
     try:
-        # NEW: Fetch from both brokers concurrently instead of waiting for one to finish
         with concurrent.futures.ThreadPoolExecutor() as executor:
             qt_future = executor.submit(get_questrade_positions)
             ibkr_future = executor.submit(get_ibkr_positions)
@@ -307,8 +273,6 @@ def positions():
             ibkr_positions = ibkr_future.result()
 
         all_positions = qt_positions + ibkr_positions
-
-        # Weighted average for shared symbols across brokers
         merged_map = {}
         for p in all_positions:
             sym = p['symbol']
@@ -317,22 +281,11 @@ def positions():
             else:
                 existing = merged_map[sym]
                 new_qty = existing['qty'] + p['qty']
-                if new_qty == 0:
-                    new_avg = 0
-                else:
-                    new_avg = ((existing['qty'] * existing['avgPrice']) + (p['qty'] * p['avgPrice'])) / new_qty
-                
+                if new_qty == 0: new_avg = 0
+                else: new_avg = ((existing['qty'] * existing['avgPrice']) + (p['qty'] * p['avgPrice'])) / new_qty
                 merged_map[sym] = {'qty': new_qty, 'avgPrice': new_avg}
 
-        # Convert back to array format
-        final_array = []
-        for sym, data in merged_map.items():
-            if data['qty'] != 0: # Hide closed positions
-                final_array.append({
-                    'symbol': sym,
-                    'qty': data['qty'],
-                    'avgPrice': data['avgPrice']
-                })
+        final_array = [{'symbol': sym, 'qty': data['qty'], 'avgPrice': data['avgPrice']} for sym, data in merged_map.items() if data['qty'] != 0]
 
         return jsonify({
             "questrade": qt_positions,
@@ -347,7 +300,6 @@ def positions():
 @app.route('/balances.json', methods=['GET'])
 def balances():
     try:
-        # NEW: Fetch balances concurrently
         with concurrent.futures.ThreadPoolExecutor() as executor:
             qt_future = executor.submit(get_questrade_balances)
             ibkr_future = executor.submit(get_ibkr_balances)
@@ -355,19 +307,14 @@ def balances():
             qt_bal = qt_future.result()
             ib_bal = ibkr_future.result()
 
-        # Calculate totals
-        total_cash = qt_bal['cash'] + ib_bal['cash']
-        total_bp = qt_bal['buyingPower'] + ib_bal['buyingPower']
-
         return jsonify({
             "questrade": qt_bal,
             "ibkr": ib_bal,
             "total": {
-                "cash": total_cash,
-                "buyingPower": total_bp
+                "cash": qt_bal['cash'] + ib_bal['cash'],
+                "buyingPower": qt_bal['buyingPower'] + ib_bal['buyingPower']
             }
         })
-
     except Exception as e:
         print(f"Error generating balances: {e}")
         return jsonify({"error": "Failed to generate balances"}), 500
@@ -375,7 +322,6 @@ def balances():
 @app.route('/equity.json', methods=['GET'])
 def equity():
     try:
-        # Fetch data concurrently
         with concurrent.futures.ThreadPoolExecutor() as executor:
             qt_future = executor.submit(get_questrade_balances)
             ibkr_future = executor.submit(get_ibkr_balances)
@@ -383,21 +329,11 @@ def equity():
             qt_data = qt_future.result()
             ib_data = ibkr_future.result()
 
-        # Calculate total combined equity
-        total_equity = qt_data['equity'] + ib_data['equity']
-
         return jsonify({
-            "questrade": {
-                "equity": qt_data['equity']
-            },
-            "ibkr": {
-                "equity": ib_data['equity']
-            },
-            "total": {
-                "equity": total_equity
-            }
+            "questrade": {"equity": qt_data['equity']},
+            "ibkr": {"equity": ib_data['equity']},
+            "total": {"equity": qt_data['equity'] + ib_data['equity']}
         })
-
     except Exception as e:
         print(f"Error generating equity: {e}")
         return jsonify({"error": "Failed to generate equity"}), 500
@@ -405,35 +341,55 @@ def equity():
 @app.route('/networth.csv', methods=['GET'])
 def networth_csv():
     try:
-        # Fetch data concurrently
         with concurrent.futures.ThreadPoolExecutor() as executor:
             qt_future = executor.submit(get_questrade_balances)
             ibkr_future = executor.submit(get_ibkr_balances)
-            
             qt_bal = qt_future.result()
             ib_bal = ibkr_future.result()
 
-        # Calculate only the grand total equity
         total_eq = qt_bal.get('equity', 0) + ib_bal.get('equity', 0)
-
-        # Return JUST the raw number as plain text
-        return app.response_class(
-            response=str(total_eq),
-            status=200,
-            mimetype='text/plain'
-        )
-
+        return app.response_class(response=str(total_eq), status=200, mimetype='text/plain')
     except Exception as e:
-        # Return 0 if there's an error so it doesn't break your spreadsheet math
         return app.response_class(response="0", status=500, mimetype='text/plain')
 
+
+# =========================================================
+# 4. EXECUTION GATEWAY (OMS - Secured Routes)
+# =========================================================
+
+@app.route('/api/kill_switch', methods=['POST'])
+@require_apikey
+def kill_switch():
+    """
+    Toggles the Global Trading Halt. If True, ALL incoming /api/order requests are instantly rejected.
+    """
+    global GLOBAL_TRADING_HALTED
+    data = request.json
+    halt = data.get('halt', True)
+    
+    GLOBAL_TRADING_HALTED = halt
+    
+    if halt:
+        print("\n" + "="*50)
+        print("[OMS] 🛑 GLOBAL KILL SWITCH ENGAGED. ALL NEW ORDERS BLOCKED.")
+        print("="*50 + "\n")
+    else:
+        print("\n[OMS] 🟢 GLOBAL TRADING RESUMED.")
+
+    return jsonify({"status": "success", "global_halt": GLOBAL_TRADING_HALTED}), 200
+
+
 @app.route('/api/order', methods=['POST'])
-@require_apikey   # <--- THE MAGIC LOCK
+@require_apikey
 def place_order():
     """
     Receives trade commands from distributed AI agents.
-    Routes to Shadow, Alpaca, or IBKR based on the payload.
+    Enforces Global Risk Limits, then routes to Shadow, Alpaca, or IBKR.
     """
+    if GLOBAL_TRADING_HALTED:
+        print("[OMS] 🛑 ORDER REJECTED: Global Kill Switch is Active!")
+        return jsonify({"status": "rejected", "message": "Global Kill Switch is Active"}), 403
+
     data = request.json
     broker = data.get('broker', 'shadow').lower()
     ticker = data.get('ticker')
@@ -447,8 +403,19 @@ def place_order():
 
     print(f"\n[OMS] 🚦 RECEIVED ORDER FROM {agent_id.upper()}: {side} {qty} {ticker} @ ${limit_price:.2f} -> DEST: {broker.upper()}")
 
+    # --- GLOBAL RISK MANAGEMENT (IBKR only for now) ---
+    if broker == 'ibkr' and side == 'BUY':
+        balances = get_ibkr_balances()
+        current_bp = balances.get('buyingPower', 0)
+        estimated_cost = qty * limit_price
+        
+        # Leave a $2,000 global safety buffer
+        if estimated_cost > (current_bp - 2000):
+            print(f"[OMS] ❌ REJECTED: Insufficient Global Buying Power. Cost: ${estimated_cost:.2f} | BP: ${current_bp:.2f}")
+            return jsonify({"status": "rejected", "reason": "GLOBAL_MARGIN_LIMIT"}), 403
+
     # ==========================================
-    # ROUTE 1: SHADOW MODE (Paper simulation without API)
+    # ROUTE 1: SHADOW MODE
     # ==========================================
     if broker == 'shadow':
         print(f"[OMS] 👻 SHADOW EXECUTION LOGGED: {side} {ticker}. No broker API invoked.")
@@ -488,8 +455,7 @@ def place_order():
         try:
             IB_GATEWAY_URL = 'https://localhost:5000/v1/api'
             acct_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/accounts", verify=False, timeout=2)
-            accounts = acct_res.json()
-            account_id = accounts[0].get('id') or accounts[0].get('accountId')
+            account_id = acct_res.json()[0].get('accountId')
 
             ibkr_payload = {
                 "orders": [{
@@ -517,8 +483,151 @@ def place_order():
     else:
         return jsonify({"status": "error", "message": f"Unknown broker target: {broker}"}), 400
 
+
+@app.route('/api/open_orders', methods=['GET'])
+@require_apikey
+def get_open_orders():
+    """
+    Fetches all currently open (unfilled) orders across brokers.
+    Accepts an optional ?ticker=XYZ parameter to filter.
+    """
+    ticker = request.args.get('ticker')
+    open_orders = []
+
+    # 1. ALPACA OPEN ORDERS
+    if alpaca_client:
+        try:
+            req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+            if ticker:
+                req.symbols = [ticker]
+                
+            alpaca_orders = alpaca_client.get_orders(req)
+            for o in alpaca_orders:
+                open_orders.append({
+                    "broker": "alpaca",
+                    "order_id": str(o.id),
+                    "ticker": o.symbol,
+                    "side": str(o.side.value if hasattr(o.side, 'value') else o.side).upper(),
+                    "qty": float(o.qty or 0),
+                    "limit_price": float(o.limit_price or 0)
+                })
+        except Exception as e:
+            print(f"[OMS] ⚠️ Failed to fetch Alpaca open orders: {e}")
+
+    # 2. IBKR OPEN ORDERS
+    try:
+        IB_GATEWAY_URL = 'https://localhost:5000/v1/api'
+        res = requests.get(f"{IB_GATEWAY_URL}/iserver/account/orders", verify=False, timeout=2)
+        if res.status_code == 200:
+            for o in res.json().get('orders', []):
+                if ticker and o.get('ticker') != ticker:
+                    continue
+                open_orders.append({
+                    "broker": "ibkr",
+                    "order_id": str(o.get('orderId')),
+                    "ticker": o.get('ticker'),
+                    "side": o.get('side'), 
+                    "qty": float(o.get('remainingQuantity', 0)),
+                    "limit_price": float(o.get('price', 0))
+                })
+    except Exception as e:
+        print(f"[OMS] ⚠️ Failed to fetch IBKR open orders: {e}")
+
+    return jsonify({"status": "success", "orders": open_orders}), 200
+
+
+@app.route('/api/cancel', methods=['POST'])
+@require_apikey
+def cancel_order():
+    """
+    Cancels a specific open order by ID.
+    Requires JSON: {"broker": "alpaca", "order_id": "12345"}
+    """
+    data = request.json
+    broker = data.get('broker', '').lower()
+    order_id = data.get('order_id')
+
+    if not broker or not order_id:
+        return jsonify({"status": "error", "message": "Missing broker or order_id"}), 400
+
+    print(f"[OMS] 🗑️ CANCEL REQUEST: {broker.upper()} Order {order_id}")
+
+    if broker == 'alpaca' and alpaca_client:
+        try:
+            alpaca_client.cancel_order_by_id(order_id)
+            return jsonify({"status": "success", "message": "Order canceled."}), 200
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    elif broker == 'ibkr':
+        try:
+            IB_GATEWAY_URL = 'https://localhost:5000/v1/api'
+            acct_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/accounts", verify=False, timeout=2)
+            account_id = acct_res.json()[0].get('accountId')
+            
+            res = requests.delete(f"{IB_GATEWAY_URL}/iserver/account/{account_id}/order/{order_id}", verify=False, timeout=2)
+            res.raise_for_status()
+            return jsonify({"status": "success", "message": "Order canceled."}), 200
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    return jsonify({"status": "error", "message": "Invalid broker target."}), 400
+
+
+@app.route('/api/flatten', methods=['POST'])
+@require_apikey
+def flatten_ticker():
+    """
+    Emergency override: Closes an open position at the market price.
+    Requires JSON: {"broker": "alpaca", "ticker": "AMD", "qty": 100}
+    """
+    data = request.json
+    broker = data.get('broker', '').lower()
+    ticker = data.get('ticker')
+    qty = float(data.get('qty', 0))
+
+    if not ticker:
+        return jsonify({"status": "error", "message": "Ticker is required."}), 400
+
+    print(f"[OMS] ⚠️ EMERGENCY FLATTEN: {qty} shares of {ticker} on {broker.upper()}")
+
+    if broker == 'alpaca' and alpaca_client:
+        try:
+            alpaca_client.close_position(ticker)
+            return jsonify({"status": "success", "message": f"{ticker} flattened on Alpaca."}), 200
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    elif broker == 'ibkr':
+        try:
+            IB_GATEWAY_URL = 'https://localhost:5000/v1/api'
+            acct_res = requests.get(f"{IB_GATEWAY_URL}/portfolio/accounts", verify=False, timeout=2)
+            account_id = acct_res.json()[0].get('accountId')
+
+            ibkr_payload = {
+                "orders": [{
+                    "cOID": f"FLATTEN_{ticker}_{int(time.time())}", 
+                    "ticker": ticker,
+                    "orderType": "MKT", 
+                    "side": "SELL",
+                    "quantity": qty,
+                    "tif": "DAY",
+                    "outsideRTH": True
+                }]
+            }
+
+            res = requests.post(f"{IB_GATEWAY_URL}/iserver/account/{account_id}/orders", json=ibkr_payload, verify=False, timeout=2)
+            res.raise_for_status()
+            return jsonify({"status": "success", "message": f"{ticker} flattened on IBKR."}), 200
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    return jsonify({"status": "error", "message": "Invalid broker."}), 400
+
+
 if __name__ == '__main__':
-    print(f"🚀 Portfolio Sync Server running at http://localhost:{PORT}")
-    print(f"🔗 Set your dashboard Sync URL to: http://localhost:{PORT}/positions.json")
-    print(f"🔗 Check live balances at: http://localhost:{PORT}/balances.json")
+    print(f"🚀 Execution Gateway & Sync Server running at http://localhost:{PORT}")
+    print(f"🔗 View Unified Balances: http://localhost:{PORT}/balances.json")
+    print(f"🔗 View Unified Positions: http://localhost:{PORT}/positions.json")
+    print(f"🔒 OMS Routing Active: PORT {PORT} | Gateway API Key Required for Execution")
     app.run(host='0.0.0.0', port=PORT)
