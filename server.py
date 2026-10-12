@@ -1179,3 +1179,285 @@ def trade_lifecycle_daemon():
                                 conn = get_db_connection()
                                 cur = conn.cursor()
                                 cur.execute("UPDATE oms_managed_trades SET is_active = FALSE, updated_at = NOW() WHERE id = %s;", (trade_id,))
+                                conn.commit()
+                                cur.close()
+                                conn.close()
+                        continue
+
+                    # 2. Holding Horizon Expiration
+                    if elapsed >= horizon:
+                        with ticker_locks[lock_key]:
+                            sellable = get_sellable_inventory('alpaca', sym, acct_id)
+                            exit_qty = min(lot_qty, sellable)
+                            if exit_qty > 0 and client:
+                                print(f"[OMS:{acct_id}] ⌛ HORIZON EXPIRED: Exiting {exit_qty} {sym} after {int(elapsed//3600)}h @ ${cur_px:.2f} (PnL: {pnl_pct*100:+.2f}%)")
+                                send_oms_telegram_alert(f"<b>[OMS HORIZON EXPIRED]</b> Flattened {exit_qty} {sym} ({acct_id}) after {int(elapsed//3600)}h @ ${cur_px:.2f} (PnL: {pnl_pct*100:+.2f}%)")
+                                client.submit_order(MarketOrderRequest(symbol=sym, qty=exit_qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
+
+                            with db_lock:
+                                conn = get_db_connection()
+                                cur = conn.cursor()
+                                cur.execute("UPDATE oms_managed_trades SET is_active = FALSE, updated_at = NOW() WHERE id = %s;", (trade_id,))
+                                conn.commit()
+                                cur.close()
+                                conn.close()
+                        continue
+
+                    # 3. Stop-Loss Barrier
+                    if pnl_pct <= mae:
+                        reason = "BREAKEVEN STOP" if mae >= 0 else "STOP LOSS"
+                        with ticker_locks[lock_key]:
+                            sellable = get_sellable_inventory('alpaca', sym, acct_id)
+                            exit_qty = min(lot_qty, sellable)
+                            if exit_qty > 0 and client:
+                                print(f"[OMS:{acct_id}] 🛑 {reason}: Exiting {exit_qty} {sym} @ ${cur_px:.2f} ({pnl_pct*100:.2f}%)")
+                                send_oms_telegram_alert(f"<b>[OMS {reason}]</b> Sold {exit_qty} {sym} ({acct_id}) @ ${cur_px:.2f} ({pnl_pct*100:.2f}%)")
+                                client.submit_order(MarketOrderRequest(symbol=sym, qty=exit_qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
+
+                            with db_lock:
+                                conn = get_db_connection()
+                                cur = conn.cursor()
+                                cur.execute("UPDATE oms_managed_trades SET is_active = FALSE, updated_at = NOW() WHERE id = %s;", (trade_id,))
+                                conn.commit()
+                                cur.close()
+                                conn.close()
+                        continue
+
+                    # 4. Take-Profit & Smart Partial Ratchet
+                    if pnl_pct >= mfe:
+                        with ticker_locks[lock_key]:
+                            if t['trail_to_breakeven'] and trailing_status == 'INITIAL' and lot_qty > 1:
+                                half_qty = int(lot_qty // 2)
+                                remaining_qty = lot_qty - half_qty
+                                sellable = get_sellable_inventory('alpaca', sym, acct_id)
+                                actual_partial = min(half_qty, sellable)
+
+                                if actual_partial > 0 and client:
+                                    print(f"[OMS:{acct_id}] 🎯 SMART PARTIAL (+{pnl_pct*100:.2f}%): Selling {actual_partial} {sym}, trailing {remaining_qty} to Breakeven (+0.1%).")
+                                    send_oms_telegram_alert(
+                                        f"<b>[OMS SMART PARTIAL]</b> Sold {actual_partial} {sym} ({acct_id}) @ ${cur_px:.2f} (+{pnl_pct*100:.2f}%).\n"
+                                        f"Trailing remaining {remaining_qty} shares with stop at Breakeven (+0.1%)."
+                                    )
+                                    client.submit_order(MarketOrderRequest(symbol=sym, qty=actual_partial, side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
+
+                                with db_lock:
+                                    conn = get_db_connection()
+                                    cur = conn.cursor()
+                                    cur.execute("""
+                                        UPDATE oms_managed_trades 
+                                        SET qty = %s, mae_stop = 0.0010, mfe_target = %s, 
+                                            trailing_status = 'BREAKEVEN_LOCKED', updated_at = NOW() 
+                                        WHERE id = %s;
+                                    """, (remaining_qty, mfe * 1.5, trade_id))
+                                    conn.commit()
+                                    cur.close()
+                                    conn.close()
+                            else:
+                                sellable = get_sellable_inventory('alpaca', sym, acct_id)
+                                exit_qty = min(lot_qty, sellable)
+                                if exit_qty > 0 and client:
+                                    print(f"[OMS:{acct_id}] 🎯 FULL TAKE PROFIT (+{pnl_pct*100:.2f}%): Exiting {exit_qty} {sym} @ ${cur_px:.2f}")
+                                    send_oms_telegram_alert(f"<b>[OMS TAKE PROFIT]</b> Closed {exit_qty} {sym} ({acct_id}) @ ${cur_px:.2f} (+{pnl_pct*100:.2f}%)")
+                                    client.submit_order(MarketOrderRequest(symbol=sym, qty=exit_qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
+
+                                with db_lock:
+                                    conn = get_db_connection()
+                                    cur = conn.cursor()
+                                    cur.execute("UPDATE oms_managed_trades SET is_active = FALSE, updated_at = NOW() WHERE id = %s;", (trade_id,))
+                                    conn.commit()
+                                    cur.close()
+                                    conn.close()
+
+        except Exception as e:
+            print(f"[OMS Lifecycle Monitor] Error: {e}")
+
+
+# =========================================================
+# 7. EMBEDDED MULTI-BROKER TRADE STREAM LISTENERS
+# =========================================================
+@dataclass
+class UnifiedTradeEvent:
+    broker: str
+    account_id: str
+    ticker: str
+    event_type: str
+    side: str
+    qty: float
+    fill_price: float
+    client_order_id: str
+    broker_order_id: str
+
+
+async def process_unified_event(event: UnifiedTradeEvent):
+    """Reconciles live WebSocket execution reports straight to PostgreSQL."""
+    print(f"[{event.broker.upper()}:{event.account_id}] ⚡ WS {event.event_type} | {event.side} {event.qty} {event.ticker} @ ${event.fill_price:.2f}")
+
+    if event.event_type in ['FILL', 'PARTIAL_FILL']:
+        try:
+            with db_lock:
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("""
+                    UPDATE oms_managed_trades 
+                    SET entry_price = %s,
+                        qty = %s,
+                        is_active = TRUE,
+                        entry_time = NOW(),
+                        updated_at = NOW()
+                    WHERE (lot_id = %s OR ticker = %s) 
+                      AND account_id = %s 
+                      AND is_active = TRUE;
+                """, (event.fill_price, event.qty, event.client_order_id, event.ticker, event.account_id))
+                conn.commit()
+                cur.close()
+                conn.close()
+            print(f"[{event.broker.upper()}:{event.account_id}] [✓] Reconciled fill in PostgreSQL for {event.ticker}.")
+        except Exception as e:
+            print(f"[WS Error] DB sync failed: {e}")
+
+    elif event.event_type in ['CANCELED', 'REJECTED']:
+        try:
+            with db_lock:
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("""
+                    UPDATE oms_managed_trades 
+                    SET is_active = FALSE, updated_at = NOW()
+                    WHERE (lot_id = %s OR ticker = %s) 
+                      AND account_id = %s;
+                """, (event.client_order_id, event.ticker, event.account_id))
+                conn.commit()
+                cur.close()
+                conn.close()
+        except Exception as e:
+            print(f"[WS Error] DB cancel sync failed: {e}")
+
+
+async def run_alpaca_stream(account_id: str, key: str, secret: str, paper: bool):
+    while True:
+        try:
+            print(f"[*] [ALPACA:{account_id}] Connecting Trade WebSocket (Paper={paper})...")
+            stream = TradingStream(key, secret, paper=paper)
+
+            async def handle_alpaca(data):
+                order = data.order
+                ev = data.event.upper()
+                normalized = UnifiedTradeEvent(
+                    broker="alpaca",
+                    account_id=account_id,
+                    ticker=order['symbol'].upper(),
+                    event_type=ev,
+                    side=str(order['side']).upper(),
+                    qty=float(order.get('filled_qty') or order.get('qty') or 0),
+                    fill_price=float(order.get('filled_avg_price') or 0.0),
+                    client_order_id=order.get('client_order_id', ''),
+                    broker_order_id=str(order.get('id', ''))
+                )
+                await process_unified_event(normalized)
+
+            stream.subscribe_trade_updates(handle_alpaca)
+            await stream._run_forever()
+        except Exception as e:
+            print(f"[!] [ALPACA:{account_id}] Socket disconnected: {e}. Reconnecting in 5s...")
+            await asyncio.sleep(5)
+
+
+async def run_ibkr_stream(account_id: str):
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+
+    while True:
+        try:
+            print(f"[*] [IBKR:{account_id}] Connecting WebSocket to {IB_WS_URL}...")
+            async with websockets.connect(IB_WS_URL, ssl=ssl_context) as ws:
+                print(f"[✓] [IBKR:{account_id}] Gateway WebSocket connected.")
+                await ws.send('sor+{}')
+                await ws.send('str+{"realtimeUpdatesOnly": true}')
+
+                async def heartbeat():
+                    while True:
+                        await asyncio.sleep(10)
+                        try:
+                            await ws.send("ech+hb")
+                        except Exception:
+                            break
+
+                hb_task = asyncio.create_task(heartbeat())
+                try:
+                    async for raw_msg in ws:
+                        if raw_msg.startswith("ech+"):
+                            continue
+                        topic = raw_msg[:3]
+                        payload_str = raw_msg[4:] if len(raw_msg) > 4 and raw_msg[3] == '+' else raw_msg
+                        try:
+                            data = json.loads(payload_str)
+                        except Exception:
+                            continue
+
+                        if topic == 'str':
+                            trades = data if isinstance(data, list) else [data]
+                            for tr in trades:
+                                side_raw = tr.get('side', '').upper()
+                                side = 'BUY' if side_raw in ['BOT', 'BUY', 'B'] else 'SELL'
+                                normalized = UnifiedTradeEvent(
+                                    broker="ibkr",
+                                    account_id=account_id,
+                                    ticker=tr.get('symbol', tr.get('contractDescription', '')).upper(),
+                                    event_type="FILL",
+                                    side=side,
+                                    qty=float(tr.get('size', 0)),
+                                    fill_price=float(tr.get('price', 0.0)),
+                                    client_order_id=tr.get('orderRef', ''),
+                                    broker_order_id=str(tr.get('executionId', ''))
+                                )
+                                await process_unified_event(normalized)
+                finally:
+                    hb_task.cancel()
+        except Exception as e:
+            print(f"[!] [IBKR:{account_id}] Socket disconnected: {e}. Reconnecting in 5s...")
+            await asyncio.sleep(5)
+
+
+def start_embedded_trade_streams():
+    """Background worker thread that runs the asyncio stream loops."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    tasks = []
+
+    # 1. Macro Swings Account
+    if k_macro and s_macro:
+        tasks.append(run_alpaca_stream("alpaca_macro", k_macro, s_macro, paper=True))
+
+    # 2. Midday Reversion Account (if configured with distinct credentials)
+    if k_midday and s_midday and k_midday != k_macro:
+        tasks.append(run_alpaca_stream("alpaca_midday", k_midday, s_midday, paper=True))
+
+    # 3. IBKR Gateway Account
+    ib_acct = os.environ.get("IBKR_ACCOUNT_ID", "DU1234567")
+    tasks.append(run_ibkr_stream(ib_acct))
+
+    print(f"[*] Embedded Trade Stream Listener active ({len(tasks)} broker pipelines).")
+    loop.run_until_complete(asyncio.gather(*tasks))
+
+
+# =========================================================
+# SERVER ENTRYPOINT
+# =========================================================
+if __name__ == '__main__':
+    init_oms_db()
+    reconcile_cold_boot_state()
+
+    # 1. 24/7 Stop / Target / Horizon Monitor Daemon
+    threading.Thread(target=trade_lifecycle_daemon, daemon=True).start()
+
+    # 2. Embedded Multi-Broker WebSocket Streams Daemon
+    threading.Thread(target=start_embedded_trade_streams, daemon=True).start()
+
+    active_alpaca_str = ", ".join(ALPACA_ACCOUNTS.keys()) if ALPACA_ACCOUNTS else "None"
+    print(f"🚀 Execution Gateway & Lifecycle OMS listening on http://0.0.0.0:{PORT}")
+    print(f"💼 Configured Alpaca Accounts: [{active_alpaca_str}]")
+    print(f"🔗 Enriched Positions: http://localhost:{PORT}/api/oms/positions?broker=alpaca&account=alpaca_macro")
+    print(f"🔒 OMS Routing: PORT {PORT} | Protected via Tailnet X-Gateway-Token")
+    app.run(host='0.0.0.0', port=PORT)
