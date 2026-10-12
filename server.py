@@ -1178,4 +1178,4 @@ def trade_lifecycle_daemon():
                             with db_lock:
                                 conn = get_db_connection()
                                 cur = conn.cursor()
-                                cur.execute("UPDATE oms_managed_trades SET is_active = FALSE, updated_at = NOW() WHERE id = %s;", (trade_
+                                cur.execute("UPDATE oms_managed_trades SET is_active = FALSE, updated_at = NOW() WHERE id = %s;", (trade_id,))
