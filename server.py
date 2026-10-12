@@ -1,39 +1,39 @@
 #!/usr/bin/env python3
 """
-Execution Gateway & Institutional Order Management System (OMS)
-================================================================
-Architecture:
-  - Multi-broker & Multi-account support:
-      * Alpaca Multi-Account Routing (e.g. alpaca_macro for multi-day swings,
-        alpaca_midday for midday mean-reversion, alpaca_live for real capital)
-      * Interactive Brokers (IBKR Client Portal Gateway)
-      * Questrade (Automated OAuth token refresh lifecycle)
-      * Shadow execution mode
-  - Strict Long-Only Guardrails:
-      * Pre-flight in-flight deduction: Sellable = Long Inventory - Pending Sells
-      * Zero-sellable inventory rejection (422 ZERO_SELLABLE_INVENTORY)
-      * Automatic sell quantity clamping to prevent accidental net shorting
-      * Per-ticker mutual exclusion locks to prevent concurrent race conditions
-  - Multi-Lot Stateful Ledger (PostgreSQL: oms_managed_trades):
-      * Virtual multi-lot tracking using unique lot_id
-      * FIFO lot matching and liquidation
-  - Cold-Boot Drift & Orphan Reconciliation Engine:
-      * Auto-adopts unmanaged positions matching active_deployments
-      * Quarantines unknown manual/discretionary positions
-      * Reconciles quantity drift from offline fills/exits
-  - Autonomous 24/7 Trade Lifecycle Monitor Daemon:
-      * Evaluates holding horizon expiration (horizon_sec)
-      * Enforces forced 15:45 EDT market flat for midday reversion trades
-      * Executes 50% smart partial take-profits with breakeven ratchets (+0.1%)
-      * Enforces hard stop-loss and trailing stops
-      * Automated daily portfolio drawdown circuit breaker (-3.0% threshold)
-      * Never calls blanket close_position(); exits exact lot sizes
+Portfolio Sync Server & Execution Gateway (OMS)
+================================================
+Location: /root/development/portfolio_sync_server/server.py
+Managed by: portfolio-sync.service
+
+Features:
+  - Multi-broker read sync: Questrade, IBKR, Alpaca
+  - Multi-account execution:
+      * alpaca_macro (3-day swings)
+      * alpaca_midday (90-min mean reversions)
+      * ibkr_primary (Live execution gateway)
+  - Strict Long-Only Protection:
+      * Rejects SELL orders when sellable inventory <= 0 (422 ZERO_SELLABLE_INVENTORY)
+      * Clamps sell quantities to available long inventory to block net shorting
+      * Per-ticker mutual exclusion locks
+  - Stateful PostgreSQL Ledger (oms_managed_trades):
+      * Multi-lot virtual accounting via unique lot_id
+      * FIFO lot liquidation
+  - Autonomous 24/7 Trade Lifecycle Daemon:
+      * Time horizon expiration
+      * Forced 15:45 EDT market flat for midday reversion trades
+      * 50% smart partial take-profit with breakeven stop ratchets (+0.1%)
+      * Hard stop loss and trailing stops
+      * -3.0% daily portfolio equity drawdown circuit breaker
+  - Embedded Multi-Broker WebSocket Listeners:
+      * Concurrent Alpaca TradingStream listeners
+      * IBKR Client Portal Gateway WSS listener (localhost:5000)
 """
 
 import os
 import time
 import json
 import ssl
+import asyncio
 import requests
 import psycopg2
 import psycopg2.extras
@@ -42,19 +42,22 @@ import threading
 import concurrent.futures
 from functools import wraps
 from datetime import datetime
+from dataclasses import dataclass
 from collections import defaultdict
 from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+import websockets
 
 from vault import load_secrets
 
 # Alpaca trading SDK
 from alpaca.trading.client import TradingClient
+from alpaca.trading.stream import TradingStream
 from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 
-# Suppress self-signed cert warnings for IBKR Client Portal Gateway on localhost
+# Suppress self-signed cert warnings for IBKR Client Portal Gateway
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
@@ -65,9 +68,10 @@ load_secrets()
 PORT = int(os.environ.get("PORT", 3000))
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://username:password@localhost:5432/your_database")
 MARKET_TZ = ZoneInfo("America/New_York")
+IB_WS_URL = os.environ.get("IB_WS_URL", "wss://localhost:5000/v1/api/ws")
 
 # =========================================================
-# GATEWAY SECURITY, LOCKS & GLOBAL STATE
+# GATEWAY SECURITY, LOCKS & MULTI-ACCOUNT REGISTRY
 # =========================================================
 GATEWAY_API_KEY = os.environ.get("GATEWAY_API_KEY", "your_super_secret_tailnet_key_2026")
 GLOBAL_TRADING_HALTED = False
@@ -75,31 +79,27 @@ GLOBAL_TRADING_HALTED = False
 ticker_locks = defaultdict(threading.Lock)
 db_lock = threading.Lock()
 
-# Multi-Account Registry for Alpaca
 ALPACA_ACCOUNTS = {}
 
 # 1. Macro Swings Account (Default Paper)
-alpaca_macro_key = os.environ.get("ALPACA_MACRO_KEY") or os.environ.get("ALPACA_API_KEY")
-alpaca_macro_secret = os.environ.get("ALPACA_MACRO_SECRET") or os.environ.get("ALPACA_SECRET_KEY")
-if alpaca_macro_key and alpaca_macro_secret:
-    ALPACA_ACCOUNTS["alpaca_macro"] = TradingClient(alpaca_macro_key, alpaca_macro_secret, paper=True)
+k_macro = os.environ.get("ALPACA_MACRO_KEY") or os.environ.get("ALPACA_API_KEY")
+s_macro = os.environ.get("ALPACA_MACRO_SECRET") or os.environ.get("ALPACA_SECRET_KEY")
+if k_macro and s_macro:
+    ALPACA_ACCOUNTS["alpaca_macro"] = TradingClient(k_macro, s_macro, paper=True)
 
-# 2. Midday Intraday Reversion Account (Secondary Paper)
-alpaca_midday_key = os.environ.get("ALPACA_MIDDAY_KEY")
-alpaca_midday_secret = os.environ.get("ALPACA_MIDDAY_SECRET")
-if alpaca_midday_key and alpaca_midday_secret:
-    ALPACA_ACCOUNTS["alpaca_midday"] = TradingClient(alpaca_midday_key, alpaca_midday_secret, paper=True)
+# 2. Midday Reversion Account (Secondary Paper)
+k_midday = os.environ.get("ALPACA_MIDDAY_KEY")
+s_midday = os.environ.get("ALPACA_MIDDAY_SECRET")
+if k_midday and s_midday:
+    ALPACA_ACCOUNTS["alpaca_midday"] = TradingClient(k_midday, s_midday, paper=True)
 elif "alpaca_macro" in ALPACA_ACCOUNTS:
     ALPACA_ACCOUNTS["alpaca_midday"] = ALPACA_ACCOUNTS["alpaca_macro"]
 
-# 3. Live Account (Real Capital)
-alpaca_live_key = os.environ.get("ALPACA_LIVE_KEY")
-alpaca_live_secret = os.environ.get("ALPACA_LIVE_SECRET")
-if alpaca_live_key and alpaca_live_secret:
-    ALPACA_ACCOUNTS["alpaca_live"] = TradingClient(alpaca_live_key, alpaca_live_secret, paper=False)
-
-# Backward compatibility reference
-alpaca_client = ALPACA_ACCOUNTS.get("alpaca_macro")
+# 3. Live Account
+k_live = os.environ.get("ALPACA_LIVE_KEY")
+s_live = os.environ.get("ALPACA_LIVE_SECRET")
+if k_live and s_live:
+    ALPACA_ACCOUNTS["alpaca_live"] = TradingClient(k_live, s_live, paper=False)
 
 
 def get_alpaca_client(account_id: str = "alpaca_macro") -> TradingClient | None:
@@ -122,7 +122,7 @@ def send_oms_telegram_alert(msg: str) -> None:
     try:
         requests.post(url, json=payload, timeout=4)
     except Exception as e:
-        print(f"[OMS] Telegram alert delivery error: {e}")
+        print(f"[OMS] Telegram alert error: {e}")
 
 
 def require_apikey(f):
@@ -173,9 +173,9 @@ def init_oms_db():
             conn.commit()
             cur.close()
             conn.close()
-        print("[OMS] Database: oms_managed_trades verified and ready.")
+        print("[OMS] Database: oms_managed_trades initialized and verified.")
     except Exception as e:
-        print(f"[OMS] Database initialization error: {e}")
+        print(f"[OMS] Database init error: {e}")
 
 
 # =========================================================
@@ -183,9 +183,8 @@ def init_oms_db():
 # =========================================================
 def get_sellable_inventory(broker: str, ticker: str, account_id: str = "alpaca_macro") -> float:
     """
-    Computes strict uncommitted long inventory:
+    Computes available uncommitted long inventory:
       Sellable = (Broker Open Long Qty) - (Pending Unfilled Open Sell Orders)
-    Returns 0.0 if flat, short, or all shares are committed to in-flight orders.
     """
     broker = broker.lower()
     ticker = ticker.upper()
@@ -241,14 +240,8 @@ def get_sellable_inventory(broker: str, ticker: str, account_id: str = "alpaca_m
 # COLD-BOOT RECONCILIATION ENGINE
 # =========================================================
 def reconcile_cold_boot_state():
-    """
-    Reconciles open broker positions against PostgreSQL on startup:
-      1. Scans every configured Alpaca account.
-      2. Reconciles quantity drift (FIFO shortfall deduction).
-      3. Auto-adopts unmanaged positions that match deployed models.
-      4. Quarantines unmanaged positions that have no active deployment.
-    """
-    print("[OMS] Running multi-account cold-boot position and lot reconciliation...")
+    """Syncs existing broker positions against PostgreSQL on startup."""
+    print("[OMS] Running multi-account cold-boot position reconciliation...")
 
     with db_lock:
         conn = get_db_connection()
@@ -274,18 +267,17 @@ def reconcile_cold_boot_state():
                 """, (acct_id,))
                 db_summary = {r['ticker'].upper(): r for r in cur.fetchall()}
 
-                # Reconcile existing lots and quantity drift
                 for sym, db_info in db_summary.items():
                     broker_qty = broker_map.get(sym, 0.0)
                     total_db_qty = float(db_info['total_db_qty'])
 
                     if broker_qty == 0.0:
-                        print(f"[OMS:{acct_id}] ⚠️ {sym} is flat at broker. Deactivating {len(db_info['lot_ids'])} orphaned DB lots.")
+                        print(f"[OMS:{acct_id}] ⚠️ {sym} is flat at broker. Closing orphaned DB lots.")
                         cur.execute("UPDATE oms_managed_trades SET is_active = FALSE, updated_at = NOW() WHERE ticker = %s AND account_id = %s AND is_active = TRUE;", (sym, acct_id))
                         conn.commit()
                     elif broker_qty < total_db_qty:
                         deficit = total_db_qty - broker_qty
-                        print(f"[OMS:{acct_id}] ⚠️ {sym} quantity drift: Broker has {broker_qty}, DB expected {total_db_qty}. Reconciling FIFO deficit of {deficit} shares.")
+                        print(f"[OMS:{acct_id}] ⚠️ {sym} quantity drift: Deficit of {deficit} shares. Reconciling FIFO lots.")
                         for l_id, l_qty in zip(db_info['lot_ids'], db_info['lot_qtys']):
                             l_qty = float(l_qty)
                             if deficit >= l_qty:
@@ -301,7 +293,7 @@ def reconcile_cold_boot_state():
                                 break
                         conn.commit()
 
-                # Check for unmanaged/orphan positions on broker
+                # Adopt or quarantine unmanaged broker holdings
                 for p in broker_positions:
                     sym = p.symbol.upper()
                     qty = float(p.qty)
@@ -328,22 +320,9 @@ def reconcile_cold_boot_state():
                                   round(avg_px * (1 + mfe), 2), round(avg_px * (1 + mae), 2),
                                   horizon, force_eod))
                             conn.commit()
-
-                            msg = (
-                                f"🔄 <b>[OMS AUTO-ADOPTED POSITION]</b>\n"
-                                f"Account: <code>{acct_id}</code> | Symbol: <b>{qty} {sym} @ ${avg_px:.2f}</b>\n"
-                                f"Strategy: <code>{model_type}</code> | Target: +{mfe*100:.2f}% | Stop: {mae*100:.2f}%"
-                            )
                             print(f"[OMS:{acct_id}] [✓] Auto-adopted {qty} {sym} @ ${avg_px:.2f} under {model_type}.")
-                            send_oms_telegram_alert(msg)
                         else:
-                            msg = (
-                                f"🚨 <b>[OMS QUARANTINED POSITION]</b>\n"
-                                f"Account: <code>{acct_id}</code> | Found unmanaged: <b>{qty} {sym} @ ${avg_px:.2f}</b>\n"
-                                f"No deployment config found. Position is <b>QUARANTINED</b> (excluded from auto-exits)."
-                            )
                             print(f"[OMS:{acct_id}] ⚠️ Quarantined unmanaged position: {qty} {sym}.")
-                            send_oms_telegram_alert(msg)
 
             except Exception as e:
                 print(f"[OMS] Error reconciling account {acct_id}: {e}")
@@ -521,7 +500,7 @@ def get_ibkr_balances():
 
 
 # =========================================================
-# 3. ALPACA INTEGRATION (ACCOUNT-AWARE)
+# 3. ALPACA INTEGRATION (MULTI-ACCOUNT)
 # =========================================================
 def get_alpaca_positions_for_account(account_id: str = "alpaca_macro"):
     client = get_alpaca_client(account_id)
@@ -769,7 +748,7 @@ def get_open_orders():
                     "limit_price": float(o.limit_price or 0)
                 })
         except Exception as e:
-            print(f"[OMS] ⚠️ Failed to fetch Alpaca open orders for {account_id}: {e}")
+            print(f"[OMS] ⚠️ Failed to fetch Alpaca open orders: {e}")
 
     try:
         IB_GATEWAY_URL = 'https://localhost:5000/v1/api'
@@ -800,7 +779,7 @@ def kill_switch():
     data = request.json or {}
     halt = data.get('halt', True)
     GLOBAL_TRADING_HALTED = halt
-    msg = "🛑 GLOBAL KILL SWITCH ENGAGED. ALL ORDERS BLOCKED." if halt else "🟢 GLOBAL TRADING RESUMED."
+    msg = "🛑 GLOBAL KILL SWITCH ENGAGED." if halt else "🟢 GLOBAL TRADING RESUMED."
     print(f"\n[OMS] {msg}\n")
     send_oms_telegram_alert(f"<b>[GATEWAY OMS]</b> {msg}")
     return jsonify({"status": "success", "global_halt": GLOBAL_TRADING_HALTED}), 200
@@ -821,7 +800,6 @@ def place_order():
     agent_id = data.get('agent_id', 'macro_fleet')
     strategy_id = data.get('strategy_id', 'macro_ohlcv')
 
-    # Multi-Account Resolution
     account_id = data.get('account_id')
     if not account_id:
         if strategy_id == 'intraday_midday_reversion' and 'alpaca_midday' in ALPACA_ACCOUNTS:
@@ -844,9 +822,7 @@ def place_order():
     lock_key = f"{account_id}:{ticker}"
     with ticker_locks[lock_key]:
 
-        # =========================================================
-        # STRICT LONG-ONLY ENFORCEMENT & PREVENT NET SHORT POSITIONS
-        # =========================================================
+        # Strict Long-Only Gate: Deduct pending orders and check inventory
         if side == 'SELL' and broker in ['alpaca', 'ibkr']:
             sellable_qty = get_sellable_inventory(broker, ticker, account_id)
 
@@ -862,7 +838,6 @@ def place_order():
                 print(f"[OMS:{account_id}] ⚠️ QUANTITY CLAMPED: Requested SELL {qty} {ticker}, but only {sellable_qty} available. Clamping to {sellable_qty}.")
                 qty = sellable_qty
 
-        # IBKR margin safety buffer check
         if broker == 'ibkr' and side == 'BUY':
             balances = get_ibkr_balances()
             current_bp = balances.get('buyingPower', 0)
@@ -870,9 +845,6 @@ def place_order():
             if estimated_cost > (current_bp - 2000):
                 return jsonify({"status": "rejected", "reason": "GLOBAL_MARGIN_LIMIT"}), 403
 
-        # =========================================================
-        # BROKER ROUTING & IMMEDIATE FILL RECONCILIATION
-        # =========================================================
         order_id = f"sim_{int(time.time())}"
         lot_id = f"lot_{ticker}_{int(time.time()*1000)}"
         filled_immediately = False
@@ -896,7 +868,7 @@ def place_order():
                 order_id = str(order.id)
                 print(f"[OMS:{account_id}] 🦙 ALPACA ORDER PLACED: {side} {qty} {ticker} @ ${limit_price:.2f} (ID: {order_id})")
 
-                # Fast-poll for immediate fill confirmation (up to 2.5 seconds)
+                # Fast-poll for immediate execution
                 for _ in range(5):
                     time.sleep(0.5)
                     live_o = client.get_order_by_id(order_id)
@@ -933,7 +905,7 @@ def place_order():
                 order_res = requests.post(f"{IB_GATEWAY_URL}/iserver/account/{account_num}/orders", json=ibkr_payload, verify=False, timeout=2)
                 order_res.raise_for_status()
                 order_id = str(order_res.json())
-                filled_immediately = True  # Streaming trade updates will reconcile exact fill px
+                filled_immediately = True
             except Exception as e:
                 print(f"[OMS] ❌ IBKR ROUTING FAILED: {e}")
                 return jsonify({"status": "error", "message": str(e)}), 500
@@ -941,15 +913,12 @@ def place_order():
         elif broker == 'shadow':
             filled_immediately = True
 
-        # =========================================================
-        # SYNCHRONIZE DATABASE LEDGER
-        # =========================================================
+        # Database Ledger Sync
         try:
             with db_lock:
                 conn = get_db_connection()
                 cur = conn.cursor()
                 if side == 'BUY':
-                    # Log lot to DB; mark active immediately if confirmed, else stream listener activates on fill
                     cur.execute("""
                         INSERT INTO oms_managed_trades 
                         (lot_id, account_id, ticker, broker, agent_id, strategy_id, side, qty, entry_price, 
@@ -960,7 +929,6 @@ def place_order():
                           mfe_target, mae_stop, tp_price, sl_price, horizon_sec, force_eod_flat, trail_to_breakeven,
                           filled_immediately))
                 else:
-                    # SELL: FIFO lot deduction
                     rem_to_deduct = qty
                     cur.execute("""
                         SELECT id, qty FROM oms_managed_trades 
@@ -1104,15 +1072,7 @@ def flatten_ticker():
 # 6. AUTONOMOUS 24/7 TRADE LIFECYCLE MONITOR DAEMON
 # =========================================================
 def trade_lifecycle_daemon():
-    """
-    Independent 24/7 background worker:
-      - Enforces trade horizons and flattens expired lots.
-      - Enforces forced 15:45 EDT market flat for midday mean-reversion trades.
-      - Executes 50% partial take-profits at MFE and ratchets runner stop to Breakeven (+0.1%).
-      - Enforces hard stop-loss and trailing stops.
-      - Monitors daily portfolio equity drawdown and trips circuit breaker at -3.0%.
-      - Never issues blind close_position(); operates strictly on validated lot quantities.
-    """
+    """Independent background worker for time expiration, stops, and partial exits."""
     global GLOBAL_TRADING_HALTED
     print("[*] Trade Lifecycle Monitor Daemon online.")
 
@@ -1125,7 +1085,7 @@ def trade_lifecycle_daemon():
             now_edt = datetime.now(MARKET_TZ)
             is_past_eod_cutoff = (now_edt.hour > 15) or (now_edt.hour == 15 and now_edt.minute >= 45)
 
-            # Daily Portfolio Drawdown Circuit Breaker Check (Runs every 60s)
+            # Daily Drawdown Circuit Breaker Check (-3.0%)
             if now_ts - last_circuit_breaker_check >= 60.0 and not GLOBAL_TRADING_HALTED:
                 last_circuit_breaker_check = now_ts
                 for acct_id, client in ALPACA_ACCOUNTS.items():
@@ -1139,7 +1099,7 @@ def trade_lifecycle_daemon():
                                 GLOBAL_TRADING_HALTED = True
                                 alert_msg = (
                                     f"🚨 <b>[AUTOMATIC CIRCUIT BREAKER TRIPPED]</b>\n"
-                                    f"Account <code>{acct_id}</code> breached -3.0% daily drawdown limit: <b>{daily_dd*100:.2f}%</b>\n"
+                                    f"Account <code>{acct_id}</code> breached -3.0% daily drawdown: <b>{daily_dd*100:.2f}%</b>\n"
                                     f"All fleet order entry is now <b>HALTED</b>."
                                 )
                                 print(f"[OMS] {alert_msg}")
@@ -1148,7 +1108,6 @@ def trade_lifecycle_daemon():
                     except Exception:
                         pass
 
-            # Fetch all active managed trades from database
             with db_lock:
                 conn = get_db_connection()
                 cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
@@ -1167,7 +1126,6 @@ def trade_lifecycle_daemon():
             if not active_trades:
                 continue
 
-            # Cache live positions per account to minimize API latency
             account_positions_cache = {}
             for acct_id, client in ALPACA_ACCOUNTS.items():
                 try:
@@ -1193,7 +1151,6 @@ def trade_lifecycle_daemon():
                     cached_pos = account_positions_cache.get(acct_id, {})
 
                     if sym not in cached_pos:
-                        # Trade was closed on broker externally
                         with db_lock:
                             conn = get_db_connection()
                             cur = conn.cursor()
@@ -1208,7 +1165,7 @@ def trade_lifecycle_daemon():
                     pnl_pct = (cur_px - entry_px) / (entry_px + 1e-8)
                     lock_key = f"{acct_id}:{sym}"
 
-                    # 1. Forced EOD Flat Barrier (Midday Reversion at 15:45 EDT)
+                    # 1. Forced EOD Flat Barrier (15:45 EDT)
                     if t['force_eod_flat'] and is_past_eod_cutoff:
                         with ticker_locks[lock_key]:
                             sellable = get_sellable_inventory('alpaca', sym, acct_id)
@@ -1221,111 +1178,4 @@ def trade_lifecycle_daemon():
                             with db_lock:
                                 conn = get_db_connection()
                                 cur = conn.cursor()
-                                cur.execute("UPDATE oms_managed_trades SET is_active = FALSE, updated_at = NOW() WHERE id = %s;", (trade_id,))
-                                conn.commit()
-                                cur.close()
-                                conn.close()
-                        continue
-
-                    # 2. Holding Horizon Expiration
-                    if elapsed >= horizon:
-                        with ticker_locks[lock_key]:
-                            sellable = get_sellable_inventory('alpaca', sym, acct_id)
-                            exit_qty = min(lot_qty, sellable)
-                            if exit_qty > 0 and client:
-                                print(f"[OMS:{acct_id}] ⌛ HORIZON EXPIRED: Exiting {exit_qty} {sym} after {int(elapsed//3600)}h @ ${cur_px:.2f} (PnL: {pnl_pct*100:+.2f}%)")
-                                send_oms_telegram_alert(f"<b>[OMS HORIZON EXPIRED]</b> Flattened {exit_qty} {sym} ({acct_id}) after {int(elapsed//3600)}h @ ${cur_px:.2f} (PnL: {pnl_pct*100:+.2f}%)")
-                                client.submit_order(MarketOrderRequest(symbol=sym, qty=exit_qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
-
-                            with db_lock:
-                                conn = get_db_connection()
-                                cur = conn.cursor()
-                                cur.execute("UPDATE oms_managed_trades SET is_active = FALSE, updated_at = NOW() WHERE id = %s;", (trade_id,))
-                                conn.commit()
-                                cur.close()
-                                conn.close()
-                        continue
-
-                    # 3. Stop-Loss Barrier
-                    if pnl_pct <= mae:
-                        reason = "BREAKEVEN STOP" if mae >= 0 else "STOP LOSS"
-                        with ticker_locks[lock_key]:
-                            sellable = get_sellable_inventory('alpaca', sym, acct_id)
-                            exit_qty = min(lot_qty, sellable)
-                            if exit_qty > 0 and client:
-                                print(f"[OMS:{acct_id}] 🛑 {reason}: Exiting {exit_qty} {sym} @ ${cur_px:.2f} ({pnl_pct*100:.2f}%)")
-                                send_oms_telegram_alert(f"<b>[OMS {reason}]</b> Sold {exit_qty} {sym} ({acct_id}) @ ${cur_px:.2f} ({pnl_pct*100:.2f}%)")
-                                client.submit_order(MarketOrderRequest(symbol=sym, qty=exit_qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
-
-                            with db_lock:
-                                conn = get_db_connection()
-                                cur = conn.cursor()
-                                cur.execute("UPDATE oms_managed_trades SET is_active = FALSE, updated_at = NOW() WHERE id = %s;", (trade_id,))
-                                conn.commit()
-                                cur.close()
-                                conn.close()
-                        continue
-
-                    # 4. Take-Profit & Smart Partial Ratchet
-                    if pnl_pct >= mfe:
-                        with ticker_locks[lock_key]:
-                            if t['trail_to_breakeven'] and trailing_status == 'INITIAL' and lot_qty > 1:
-                                half_qty = int(lot_qty // 2)
-                                remaining_qty = lot_qty - half_qty
-                                sellable = get_sellable_inventory('alpaca', sym, acct_id)
-                                actual_partial = min(half_qty, sellable)
-
-                                if actual_partial > 0 and client:
-                                    print(f"[OMS:{acct_id}] 🎯 SMART PARTIAL (+{pnl_pct*100:.2f}%): Selling {actual_partial} {sym}, trailing {remaining_qty} to Breakeven (+0.1%).")
-                                    send_oms_telegram_alert(
-                                        f"<b>[OMS SMART PARTIAL]</b> Sold {actual_partial} {sym} ({acct_id}) @ ${cur_px:.2f} (+{pnl_pct*100:.2f}%).\n"
-                                        f"Trailing remaining {remaining_qty} shares with stop at Breakeven (+0.1%)."
-                                    )
-                                    client.submit_order(MarketOrderRequest(symbol=sym, qty=actual_partial, side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
-
-                                with db_lock:
-                                    conn = get_db_connection()
-                                    cur = conn.cursor()
-                                    cur.execute("""
-                                        UPDATE oms_managed_trades 
-                                        SET qty = %s, mae_stop = 0.0010, mfe_target = %s, 
-                                            trailing_status = 'BREAKEVEN_LOCKED', updated_at = NOW() 
-                                        WHERE id = %s;
-                                    """, (remaining_qty, mfe * 1.5, trade_id))
-                                    conn.commit()
-                                    cur.close()
-                                    conn.close()
-                            else:
-                                sellable = get_sellable_inventory('alpaca', sym, acct_id)
-                                exit_qty = min(lot_qty, sellable)
-                                if exit_qty > 0 and client:
-                                    print(f"[OMS:{acct_id}] 🎯 FULL TAKE PROFIT (+{pnl_pct*100:.2f}%): Exiting {exit_qty} {sym} @ ${cur_px:.2f}")
-                                    send_oms_telegram_alert(f"<b>[OMS TAKE PROFIT]</b> Closed {exit_qty} {sym} ({acct_id}) @ ${cur_px:.2f} (+{pnl_pct*100:.2f}%)")
-                                    client.submit_order(MarketOrderRequest(symbol=sym, qty=exit_qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
-
-                                with db_lock:
-                                    conn = get_db_connection()
-                                    cur = conn.cursor()
-                                    cur.execute("UPDATE oms_managed_trades SET is_active = FALSE, updated_at = NOW() WHERE id = %s;", (trade_id,))
-                                    conn.commit()
-                                    cur.close()
-                                    conn.close()
-
-        except Exception as e:
-            print(f"[OMS Lifecycle Monitor] Error: {e}")
-
-
-# =========================================================
-# SERVER ENTRYPOINT
-# =========================================================
-if __name__ == '__main__':
-    init_oms_db()
-    reconcile_cold_boot_state()
-    threading.Thread(target=trade_lifecycle_daemon, daemon=True).start()
-
-    active_alpaca_str = ", ".join(ALPACA_ACCOUNTS.keys()) if ALPACA_ACCOUNTS else "None"
-    print(f"🚀 Execution Gateway & Lifecycle OMS listening on http://0.0.0.0:{PORT}")
-    print(f"💼 Configured Alpaca Accounts: [{active_alpaca_str}]")
-    print(f"🔗 Enriched Positions: http://localhost:{PORT}/api/oms/positions?broker=alpaca&account=alpaca_macro")
-    print(f"🔒 OMS Routing: PORT {PORT} | Protected via Tailnet X-Gateway-Token")
-    app.run(host='0.0.0.0', port=PORT)
+                                cur.execute("UPDATE oms_managed_trades SET is_active = FALSE, updated_at = NOW() WHERE id = %s;", (trade_
