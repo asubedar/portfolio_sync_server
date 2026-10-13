@@ -10,6 +10,7 @@ Features:
   - Multi-account execution:
       * alpaca_macro (3-day swings)
       * alpaca_midday (90-min mean reversions)
+      * alpaca_power_hour / alpaca_paper (50-min closing momentum)
       * ibkr_primary (Live execution gateway)
   - Strict Long-Only Protection:
       * Rejects SELL orders when sellable inventory <= 0 (422 ZERO_SELLABLE_INVENTORY)
@@ -19,8 +20,8 @@ Features:
       * Multi-lot virtual accounting via unique lot_id
       * FIFO lot liquidation
   - Autonomous 24/7 Trade Lifecycle Daemon:
+      * Dynamic EOD liquidations: 15:55 EDT (Power Hour) vs 15:45 EDT (Midday)
       * Time horizon expiration
-      * Forced 15:45 EDT market flat for midday reversion trades
       * 50% smart partial take-profit with breakeven stop ratchets (+0.1%)
       * Hard stop loss and trailing stops
       * -3.0% daily portfolio equity drawdown circuit breaker
@@ -95,7 +96,18 @@ if k_midday and s_midday:
 elif "alpaca_macro" in ALPACA_ACCOUNTS:
     ALPACA_ACCOUNTS["alpaca_midday"] = ALPACA_ACCOUNTS["alpaca_macro"]
 
-# 3. Live Account
+# 3. Power Hour / Paper Staging Aliases
+k_power = os.environ.get("ALPACA_POWER_HOUR_KEY") or os.environ.get("ALPACA_PAPER_KEY")
+s_power = os.environ.get("ALPACA_POWER_HOUR_SECRET") or os.environ.get("ALPACA_PAPER_SECRET")
+if k_power and s_power:
+    client_ph = TradingClient(k_power, s_power, paper=True)
+    ALPACA_ACCOUNTS["alpaca_power_hour"] = client_ph
+    ALPACA_ACCOUNTS["alpaca_paper"] = client_ph
+elif "alpaca_macro" in ALPACA_ACCOUNTS:
+    ALPACA_ACCOUNTS["alpaca_power_hour"] = ALPACA_ACCOUNTS["alpaca_macro"]
+    ALPACA_ACCOUNTS["alpaca_paper"] = ALPACA_ACCOUNTS["alpaca_macro"]
+
+# 4. Live Production Account
 k_live = os.environ.get("ALPACA_LIVE_KEY")
 s_live = os.environ.get("ALPACA_LIVE_SECRET")
 if k_live and s_live:
@@ -137,7 +149,7 @@ def require_apikey(f):
 
 
 # =========================================================
-# DATABASE INITIALIZATION
+# DATABASE INITIALIZATION & MIGRATION
 # =========================================================
 def init_oms_db():
     try:
@@ -162,18 +174,20 @@ def init_oms_db():
                     sl_price NUMERIC(12, 4),
                     horizon_sec INT DEFAULT 259200,
                     force_eod_flat BOOLEAN DEFAULT FALSE,
+                    eod_cutoff VARCHAR(16) DEFAULT '15:45',
                     trail_to_breakeven BOOLEAN DEFAULT TRUE,
                     trailing_status VARCHAR(32) DEFAULT 'INITIAL',
                     entry_time TIMESTAMPTZ DEFAULT NOW(),
                     is_active BOOLEAN DEFAULT TRUE,
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 );
+                ALTER TABLE oms_managed_trades ADD COLUMN IF NOT EXISTS eod_cutoff VARCHAR(16) DEFAULT '15:45';
                 CREATE INDEX IF NOT EXISTS idx_oms_managed_active ON oms_managed_trades (account_id, ticker, is_active);
             """)
             conn.commit()
             cur.close()
             conn.close()
-        print("[OMS] Database: oms_managed_trades initialized and verified.")
+        print("[OMS] Database: oms_managed_trades verified with dynamic eod_cutoff support.")
     except Exception as e:
         print(f"[OMS] Database init error: {e}")
 
@@ -182,10 +196,6 @@ def init_oms_db():
 # INVENTORY CONTROLS & STRICT SHORT PREVENTION
 # =========================================================
 def get_sellable_inventory(broker: str, ticker: str, account_id: str = "alpaca_macro") -> float:
-    """
-    Computes available uncommitted long inventory:
-      Sellable = (Broker Open Long Qty) - (Pending Unfilled Open Sell Orders)
-    """
     broker = broker.lower()
     ticker = ticker.upper()
     current_long_qty = 0.0
@@ -240,7 +250,6 @@ def get_sellable_inventory(broker: str, ticker: str, account_id: str = "alpaca_m
 # COLD-BOOT RECONCILIATION ENGINE
 # =========================================================
 def reconcile_cold_boot_state():
-    """Syncs existing broker positions against PostgreSQL on startup."""
     print("[OMS] Running multi-account cold-boot position reconciliation...")
 
     with db_lock:
@@ -305,22 +314,23 @@ def reconcile_cold_boot_state():
                             mfe = float(conf.get('mfe_target', 0.025))
                             mae = float(conf.get('mae_stop', -0.018))
                             horizon = int(conf.get('horizon_sec', 259200))
-                            model_type = conf.get('model_type', 'macro_ohlcv')
-                            force_eod = bool(model_type == 'intraday_midday_reversion')
+                            model_type = conf.get('strategy_id') or conf.get('model_type', 'macro_ohlcv')
+                            force_eod = bool(model_type in ['intraday_midday_reversion', 'intraday_power_hour'])
+                            eod_cutoff = conf.get('eod_cutoff', '15:55' if model_type == 'intraday_power_hour' else '15:45')
                             lot_id = f"adopt_{sym}_{int(time.time()*1000)}"
 
                             cur.execute("""
                                 INSERT INTO oms_managed_trades 
                                 (lot_id, account_id, ticker, broker, agent_id, strategy_id, side, qty, entry_price, 
-                                 mfe_target, mae_stop, tp_price, sl_price, horizon_sec, force_eod_flat, 
+                                 mfe_target, mae_stop, tp_price, sl_price, horizon_sec, force_eod_flat, eod_cutoff,
                                  trail_to_breakeven, trailing_status, entry_time, is_active, updated_at)
                                 VALUES (%s, %s, %s, 'alpaca', 'cold_boot_recovery', %s, 'BUY', %s, %s,
-                                        %s, %s, %s, %s, %s, %s, TRUE, 'INITIAL', NOW(), TRUE, NOW());
+                                        %s, %s, %s, %s, %s, %s, %s, TRUE, 'INITIAL', NOW(), TRUE, NOW());
                             """, (lot_id, acct_id, sym, model_type, qty, avg_px, mfe, mae,
                                   round(avg_px * (1 + mfe), 2), round(avg_px * (1 + mae), 2),
-                                  horizon, force_eod))
+                                  horizon, force_eod, eod_cutoff))
                             conn.commit()
-                            print(f"[OMS:{acct_id}] [✓] Auto-adopted {qty} {sym} @ ${avg_px:.2f} under {model_type}.")
+                            print(f"[OMS:{acct_id}] [✓] Auto-adopted {qty} {sym} @ ${avg_px:.2f} under {model_type} (Cutoff: {eod_cutoff}).")
                         else:
                             print(f"[OMS:{acct_id}] ⚠️ Quarantined unmanaged position: {qty} {sym}.")
 
@@ -619,7 +629,7 @@ def enrich_positions_with_managed_metadata(raw_positions: list, broker: str, acc
             cur.execute("""
                 SELECT lot_id, account_id, ticker, strategy_id, agent_id, side, qty, entry_price, 
                        mfe_target, mae_stop, tp_price, sl_price, horizon_sec, 
-                       force_eod_flat, trail_to_breakeven, trailing_status,
+                       force_eod_flat, eod_cutoff, trail_to_breakeven, trailing_status,
                        EXTRACT(EPOCH FROM entry_time) as entry_epoch
                 FROM oms_managed_trades
                 WHERE broker = %s AND account_id = %s AND is_active = TRUE
@@ -661,6 +671,7 @@ def enrich_positions_with_managed_metadata(raw_positions: list, broker: str, acc
                     "elapsed_sec": elapsed,
                     "time_remaining_sec": rem,
                     "force_eod_flat": bool(primary_lot['force_eod_flat']),
+                    "eod_cutoff": primary_lot.get('eod_cutoff', '15:45'),
                     "trailing_status": primary_lot['trailing_status'],
                     "entry_time": datetime.fromtimestamp(primary_lot['entry_epoch'], tz=MARKET_TZ).isoformat()
                 })
@@ -675,6 +686,7 @@ def enrich_positions_with_managed_metadata(raw_positions: list, broker: str, acc
                     "horizon_sec": 259200,
                     "time_remaining_sec": 259200,
                     "force_eod_flat": False,
+                    "eod_cutoff": "none",
                     "trailing_status": "INITIAL"
                 })
             enriched.append(pos_dict)
@@ -802,15 +814,18 @@ def place_order():
 
     account_id = data.get('account_id')
     if not account_id:
-        if strategy_id == 'intraday_midday_reversion' and 'alpaca_midday' in ALPACA_ACCOUNTS:
+        if strategy_id == 'intraday_power_hour':
+            account_id = 'alpaca_paper'
+        elif strategy_id == 'intraday_midday_reversion' and 'alpaca_midday' in ALPACA_ACCOUNTS:
             account_id = 'alpaca_midday'
         else:
             account_id = 'alpaca_macro'
 
-    mfe_target = float(data.get('mfe_target', 0.025))
-    mae_stop = float(data.get('mae_stop', -0.018))
-    horizon_sec = int(data.get('horizon_sec', 259200))
-    force_eod_flat = bool(data.get('force_eod_flat', False))
+    mfe_target = float(data.get('mfe_target', 0.0075 if strategy_id == 'intraday_power_hour' else 0.025))
+    mae_stop = float(data.get('mae_stop', -0.0045 if strategy_id == 'intraday_power_hour' else -0.018))
+    horizon_sec = int(data.get('horizon_sec', 3000 if strategy_id == 'intraday_power_hour' else 259200))
+    force_eod_flat = bool(data.get('force_eod_flat', strategy_id in ['intraday_power_hour', 'intraday_midday_reversion']))
+    eod_cutoff = str(data.get('eod_cutoff', '15:55' if strategy_id == 'intraday_power_hour' else '15:45'))
     trail_to_breakeven = bool(data.get('trail_to_breakeven', True))
 
     tp_price = round(limit_price * (1.0 + mfe_target), 2)
@@ -922,11 +937,11 @@ def place_order():
                     cur.execute("""
                         INSERT INTO oms_managed_trades 
                         (lot_id, account_id, ticker, broker, agent_id, strategy_id, side, qty, entry_price, 
-                         mfe_target, mae_stop, tp_price, sl_price, horizon_sec, force_eod_flat, 
+                         mfe_target, mae_stop, tp_price, sl_price, horizon_sec, force_eod_flat, eod_cutoff,
                          trail_to_breakeven, trailing_status, entry_time, is_active, updated_at)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'INITIAL', NOW(), %s, NOW());
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'INITIAL', NOW(), %s, NOW());
                     """, (lot_id, account_id, ticker, broker, agent_id, strategy_id, side, qty, actual_entry_price,
-                          mfe_target, mae_stop, tp_price, sl_price, horizon_sec, force_eod_flat, trail_to_breakeven,
+                          mfe_target, mae_stop, tp_price, sl_price, horizon_sec, force_eod_flat, eod_cutoff, trail_to_breakeven,
                           filled_immediately))
                 else:
                     rem_to_deduct = qty
@@ -1053,9 +1068,9 @@ def flatten_ticker():
                         "cOID": f"FLATTEN_{ticker}_{int(time.time())}", 
                         "ticker": ticker,
                         "orderType": "MKT", 
-                        "side": "SELL",
-                        "quantity": actual_qty,
-                        "tif": "DAY",
+                        "side": "SELL", 
+                        "quantity": actual_qty, 
+                        "tif": "DAY", 
                         "outsideRTH": True
                     }]
                 }
@@ -1072,18 +1087,18 @@ def flatten_ticker():
 # 6. AUTONOMOUS 24/7 TRADE LIFECYCLE MONITOR DAEMON
 # =========================================================
 def trade_lifecycle_daemon():
-    """Independent background worker for time expiration, stops, and partial exits."""
+    """Independent background worker for time expiration, stops, and dynamic EOD exits."""
     global GLOBAL_TRADING_HALTED
-    print("[*] Trade Lifecycle Monitor Daemon online.")
+    print("[*] Trade Lifecycle Monitor Daemon online (Dynamic EOD Cutoffs Active).")
 
     last_circuit_breaker_check = 0.0
 
     while True:
         try:
-            time.sleep(5)
+            time.sleep(4)
             now_ts = time.time()
             now_edt = datetime.now(MARKET_TZ)
-            is_past_eod_cutoff = (now_edt.hour > 15) or (now_edt.hour == 15 and now_edt.minute >= 45)
+            current_time_str = now_edt.strftime("%H:%M")
 
             # Daily Drawdown Circuit Breaker Check (-3.0%)
             if now_ts - last_circuit_breaker_check >= 60.0 and not GLOBAL_TRADING_HALTED:
@@ -1112,8 +1127,8 @@ def trade_lifecycle_daemon():
                 conn = get_db_connection()
                 cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
                 cur.execute("""
-                    SELECT id, lot_id, account_id, ticker, broker, qty, entry_price, mfe_target, mae_stop, 
-                           horizon_sec, force_eod_flat, trail_to_breakeven, trailing_status,
+                    SELECT id, lot_id, account_id, ticker, broker, strategy_id, qty, entry_price, mfe_target, mae_stop, 
+                           horizon_sec, force_eod_flat, eod_cutoff, trail_to_breakeven, trailing_status,
                            EXTRACT(EPOCH FROM entry_time) as entry_epoch
                     FROM oms_managed_trades
                     WHERE is_active = TRUE
@@ -1138,6 +1153,7 @@ def trade_lifecycle_daemon():
                 sym = t['ticker'].upper()
                 broker = t['broker'].lower()
                 acct_id = t['account_id']
+                strat_id = t['strategy_id']
                 lot_qty = float(t['qty'])
                 entry_px = float(t['entry_price'])
                 mfe = float(t['mfe_target'])
@@ -1145,6 +1161,9 @@ def trade_lifecycle_daemon():
                 horizon = int(t['horizon_sec'])
                 elapsed = now_ts - float(t['entry_epoch'])
                 trailing_status = t['trailing_status']
+
+                # Dynamic per-trade EOD Cutoff calculation
+                cutoff_str = t.get('eod_cutoff') or ('15:55' if strat_id == 'intraday_power_hour' else '15:45')
 
                 if broker == 'alpaca':
                     client = get_alpaca_client(acct_id)
@@ -1165,14 +1184,14 @@ def trade_lifecycle_daemon():
                     pnl_pct = (cur_px - entry_px) / (entry_px + 1e-8)
                     lock_key = f"{acct_id}:{sym}"
 
-                    # 1. Forced EOD Flat Barrier (15:45 EDT)
-                    if t['force_eod_flat'] and is_past_eod_cutoff:
+                    # 1. Dynamic Forced EOD Flat Barrier (15:55 for Power Hour, 15:45 for Midday)
+                    if t['force_eod_flat'] and current_time_str >= cutoff_str:
                         with ticker_locks[lock_key]:
                             sellable = get_sellable_inventory('alpaca', sym, acct_id)
                             exit_qty = min(lot_qty, sellable)
                             if exit_qty > 0 and client:
-                                print(f"[OMS:{acct_id}] ⏱️ EOD CUTOFF (15:45 EDT): Exiting {exit_qty} {sym} @ ${cur_px:.2f} (PnL: {pnl_pct*100:+.2f}%)")
-                                send_oms_telegram_alert(f"<b>[OMS EOD CUTOFF]</b> Flattened {exit_qty} {sym} ({acct_id}) @ ${cur_px:.2f} (PnL: {pnl_pct*100:+.2f}%)")
+                                print(f"[OMS:{acct_id}] ⏱️ EOD CUTOFF ({cutoff_str} EDT): Exiting {exit_qty} {sym} @ ${cur_px:.2f} (PnL: {pnl_pct*100:+.2f}%)")
+                                send_oms_telegram_alert(f"<b>[OMS EOD CUTOFF]</b> Flattened {exit_qty} {sym} ({acct_id} | {strat_id}) @ ${cur_px:.2f} (PnL: {pnl_pct*100:+.2f}%)")
                                 client.submit_order(MarketOrderRequest(symbol=sym, qty=exit_qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
 
                             with db_lock:
@@ -1190,8 +1209,9 @@ def trade_lifecycle_daemon():
                             sellable = get_sellable_inventory('alpaca', sym, acct_id)
                             exit_qty = min(lot_qty, sellable)
                             if exit_qty > 0 and client:
-                                print(f"[OMS:{acct_id}] ⌛ HORIZON EXPIRED: Exiting {exit_qty} {sym} after {int(elapsed//3600)}h @ ${cur_px:.2f} (PnL: {pnl_pct*100:+.2f}%)")
-                                send_oms_telegram_alert(f"<b>[OMS HORIZON EXPIRED]</b> Flattened {exit_qty} {sym} ({acct_id}) after {int(elapsed//3600)}h @ ${cur_px:.2f} (PnL: {pnl_pct*100:+.2f}%)")
+                                h_str = f"{int(elapsed//3600)}h" if elapsed >= 3600 else f"{int(elapsed//60)}m"
+                                print(f"[OMS:{acct_id}] ⌛ HORIZON EXPIRED: Exiting {exit_qty} {sym} after {h_str} @ ${cur_px:.2f} (PnL: {pnl_pct*100:+.2f}%)")
+                                send_oms_telegram_alert(f"<b>[OMS HORIZON EXPIRED]</b> Flattened {exit_qty} {sym} ({acct_id}) after {h_str} @ ${cur_px:.2f} (PnL: {pnl_pct*100:+.2f}%)")
                                 client.submit_order(MarketOrderRequest(symbol=sym, qty=exit_qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
 
                             with db_lock:
@@ -1434,7 +1454,11 @@ def start_embedded_trade_streams():
     if k_midday and s_midday and k_midday != k_macro:
         tasks.append(run_alpaca_stream("alpaca_midday", k_midday, s_midday, paper=True))
 
-    # 3. IBKR Gateway Account
+    # 3. Dedicated Power Hour Account (if configured with distinct credentials)
+    if k_power and s_power and k_power not in [k_macro, k_midday]:
+        tasks.append(run_alpaca_stream("alpaca_power_hour", k_power, s_power, paper=True))
+
+    # 4. IBKR Gateway Account
     ib_acct = os.environ.get("IBKR_ACCOUNT_ID", "DU1234567")
     tasks.append(run_ibkr_stream(ib_acct))
 
