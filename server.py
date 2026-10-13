@@ -519,10 +519,21 @@ def get_alpaca_positions_for_account(account_id: str = "alpaca_macro"):
     try:
         positions = client.get_all_positions()
         return [{
-            'symbol': p.symbol, 
-            'qty': float(p.qty), 
+            'symbol': p.symbol.upper(),
+            'qty': float(p.qty),
+            # Support both camelCase and snake_case for UI consumers
+            'entry_price': float(p.avg_entry_price),
             'avgPrice': float(p.avg_entry_price),
-            'currentPrice': float(p.current_price)
+            'current_price': float(p.current_price),
+            'currentPrice': float(p.current_price),
+            'market_value': float(p.market_value),
+            'marketValue': float(p.market_value),
+            'cost_basis': float(p.cost_basis),
+            'unrealized_pl': float(p.unrealized_pl),
+            'unrealized_pnl': float(p.unrealized_pl),
+            'unrealized_plpc': float(p.unrealized_plpc),
+            'pnl_pct': float(p.unrealized_plpc) * 100.0,
+            'change_today': float(p.change_today or 0.0)
         } for p in positions]
     except Exception as e:
         print(f"⚠️ Alpaca Error fetching positions for {account_id}: {e}")
@@ -531,18 +542,23 @@ def get_alpaca_positions_for_account(account_id: str = "alpaca_macro"):
 def get_alpaca_balances_for_account(account_id: str = "alpaca_macro"):
     client = get_alpaca_client(account_id)
     if not client:
-        return {'cash': 0, 'buyingPower': 0, 'equity': 0, 'last_equity': 0}
+        return {'cash': 0, 'buyingPower': 0, 'equity': 0, 'portfolio_value': 0, 'last_equity': 0}
     try:
         acct = client.get_account()
+        equity_val = float(acct.equity)
         return {
             'cash': float(acct.cash),
             'buyingPower': float(acct.buying_power),
-            'equity': float(acct.equity),
+            'buying_power': float(acct.buying_power),
+            'equity': equity_val,
+            'portfolio_value': float(getattr(acct, 'portfolio_value', equity_val)),
+            'capital': equity_val,
+            'account_capital': equity_val,
             'last_equity': float(acct.last_equity)
         }
     except Exception as e:
         print(f"⚠️ Alpaca Error fetching balances for {account_id}: {e}")
-        return {'cash': 0, 'buyingPower': 0, 'equity': 0, 'last_equity': 0}
+        return {'cash': 0, 'buyingPower': 0, 'equity': 0, 'portfolio_value': 0, 'last_equity': 0}
 
 
 # =========================================================
