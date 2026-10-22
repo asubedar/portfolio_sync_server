@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+kill_switch_config.json
+.DS_Store
