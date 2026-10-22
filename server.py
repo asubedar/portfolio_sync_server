@@ -24,7 +24,19 @@ Features:
       * Time horizon expiration
       * 50% smart partial take-profit with breakeven stop ratchets (+0.1%)
       * Hard stop loss and trailing stops
-      * -3.0% daily portfolio equity drawdown circuit breaker
+  - Global Kill Switch / Circuit Breaker (blocks NEW RISK only):
+      * The switch refuses BUY orders; SELL orders (stop-outs, flattens, exits) are
+        NEVER blocked — a panic button that also freezes exits leaves losing
+        positions open all day.
+      * Manual:    POST /api/kill_switch {"halt": true|false}
+      * Status:    GET  /api/kill_switch
+      * Automatic: trips when daily equity drawdown (vs previous close) breaches the
+        threshold (-3.0% by default).
+      * Operator overrides (persisted to kill_switch_config.json):
+          {"latch": true}          manual override — the auto breaker cannot re-trip
+                                    (it releases itself once the drawdown recovers)
+          {"auto_breaker": false}  disable the automatic drawdown breaker entirely
+          {"threshold": -0.05}     change the drawdown that trips it
   - Embedded Multi-Broker WebSocket Listeners:
       * Concurrent Alpaca TradingStream listeners
       * IBKR Client Portal Gateway WSS listener (localhost:5000)
@@ -75,7 +87,58 @@ IB_WS_URL = os.environ.get("IB_WS_URL", "wss://localhost:5000/v1/api/ws")
 # GATEWAY SECURITY, LOCKS & MULTI-ACCOUNT REGISTRY
 # =========================================================
 GATEWAY_API_KEY = os.environ.get("GATEWAY_API_KEY", "your_super_secret_tailnet_key_2026")
+
+# =========================================================
+# GLOBAL KILL SWITCH
+# =========================================================
+# The kill switch blocks NEW RISK (BUY orders) only. Exits (SELL) are NEVER blocked:
+# a panic button that also freezes stop-outs is how a bad hour becomes a bad day.
+#
+#   GLOBAL_TRADING_HALTED  — the live switch (in-memory; a restart clears it)
+#   KILL_SWITCH_CONFIG     — operator settings, persisted to disk so a restart does
+#                            not silently re-arm the automatic breaker
 GLOBAL_TRADING_HALTED = False
+
+KILL_SWITCH_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'kill_switch_config.json')
+KILL_SWITCH_CONFIG = {
+    "auto_breaker": True,   # automatic daily-drawdown trip
+    "threshold": -0.03,     # daily drawdown that trips it (equity vs previous close)
+    "latch": False,         # manual override: the automatic breaker cannot re-trip
+    "block_exits": False,   # retained for compatibility; exits are always allowed
+}
+
+
+def kill_switch_blocks(side: str) -> bool:
+    """Does the kill switch refuse this order?
+
+    NEW RISK (BUY) is blocked while the switch is on. Exits (SELL) are NEVER blocked:
+    a panic button that also freezes stop-outs and flattens turns a bad hour into a
+    bad day, because the losing positions can never be closed.
+    """
+    if not GLOBAL_TRADING_HALTED:
+        return False
+    return str(side).upper() != "SELL"
+
+
+def load_kill_switch_config():
+    try:
+        if os.path.exists(KILL_SWITCH_CONFIG_PATH):
+            with open(KILL_SWITCH_CONFIG_PATH, "r") as f:
+                KILL_SWITCH_CONFIG.update(json.load(f))
+    except Exception as e:
+        print(f"[OMS] Could not read kill switch config: {e}")
+    return KILL_SWITCH_CONFIG
+
+
+def save_kill_switch_config():
+    try:
+        with open(KILL_SWITCH_CONFIG_PATH, "w") as f:
+            json.dump(KILL_SWITCH_CONFIG, f, indent=2)
+    except Exception as e:
+        print(f"[OMS] Could not persist kill switch config: {e}")
+
+
+load_kill_switch_config()
 
 ticker_locks = defaultdict(threading.Lock)
 db_lock = threading.Lock()
@@ -800,29 +863,111 @@ def get_open_orders():
     return jsonify({"status": "success", "orders": open_orders}), 200
 
 
+def _current_daily_dd():
+    """Worst day-over-day equity drawdown across the registered accounts."""
+    worst = None
+    for acct_id, client in ALPACA_ACCOUNTS.items():
+        try:
+            acct_info = client.get_account()
+            eq = float(acct_info.equity)
+            last_eq = float(acct_info.last_equity)
+            if last_eq > 0:
+                dd = (eq - last_eq) / last_eq
+                if worst is None or dd < worst[1]:
+                    worst = (acct_id, dd, eq, last_eq)
+        except Exception:
+            pass
+    return worst
+
+
+@app.route('/api/kill_switch', methods=['GET'])
+@require_apikey
+def kill_switch_status():
+    """Read-only view of the kill switch so clients can show WHY orders are rejected."""
+    worst = _current_daily_dd()
+    return jsonify({
+        "status": "success",
+        "global_halt": GLOBAL_TRADING_HALTED,
+        "auto_breaker": KILL_SWITCH_CONFIG.get("auto_breaker", True),
+        "threshold": KILL_SWITCH_CONFIG.get("threshold", -0.03),
+        "latch": KILL_SWITCH_CONFIG.get("latch", False),
+        "exits_blocked": False,
+        "daily_dd": round(worst[1], 5) if worst else None,
+        "daily_dd_account": worst[0] if worst else None,
+        "equity": round(worst[2], 2) if worst else None,
+        "last_equity": round(worst[3], 2) if worst else None,
+    }), 200
+
+
 @app.route('/api/kill_switch', methods=['POST'])
 @require_apikey
 def kill_switch():
+    """Control the kill switch.
+
+    POST /api/kill_switch
+      {"halt": true|false}          manual engage / resume  (default: true)
+      {"latch": true|false}         manual override — the automatic breaker cannot
+                                    re-trip while latched (it clears itself once the
+                                    drawdown recovers above the threshold)
+      {"auto_breaker": true|false}  enable / disable the automatic drawdown breaker
+      {"threshold": -0.05}          override the drawdown that trips the breaker
+
+    Exits (SELL orders) are never blocked, in any of these states.
+    """
     global GLOBAL_TRADING_HALTED
     data = request.json or {}
-    halt = data.get('halt', True)
-    GLOBAL_TRADING_HALTED = halt
-    msg = "🛑 GLOBAL KILL SWITCH ENGAGED." if halt else "🟢 GLOBAL TRADING RESUMED."
-    print(f"\n[OMS] {msg}\n")
+
+    if "auto_breaker" in data:
+        KILL_SWITCH_CONFIG["auto_breaker"] = bool(data["auto_breaker"])
+    if "threshold" in data:
+        try:
+            KILL_SWITCH_CONFIG["threshold"] = float(data["threshold"])
+        except (TypeError, ValueError):
+            pass
+    if "latch" in data:
+        KILL_SWITCH_CONFIG["latch"] = bool(data["latch"])
+    if "halt" in data:
+        GLOBAL_TRADING_HALTED = bool(data["halt"])
+    elif "latch" in data and not data["latch"]:
+        # Releasing the latch with no explicit halt clears the switch too.
+        GLOBAL_TRADING_HALTED = False
+    save_kill_switch_config()
+
+    halt = GLOBAL_TRADING_HALTED
+    msg = "🛑 GLOBAL KILL SWITCH ENGAGED (new entries blocked; exits still allowed)." if halt \
+        else "🟢 GLOBAL TRADING RESUMED."
+    if KILL_SWITCH_CONFIG.get("latch"):
+        msg += " Manual latch engaged — the automatic breaker will not re-trip."
+    if not KILL_SWITCH_CONFIG.get("auto_breaker", True):
+        msg += " Automatic drawdown breaker is DISABLED."
+    print(f"\n[OMS] {msg} (config: {KILL_SWITCH_CONFIG})\n")
     send_oms_telegram_alert(f"<b>[GATEWAY OMS]</b> {msg}")
-    return jsonify({"status": "success", "global_halt": GLOBAL_TRADING_HALTED}), 200
+    return jsonify({
+        "status": "success",
+        "global_halt": GLOBAL_TRADING_HALTED,
+        "auto_breaker": KILL_SWITCH_CONFIG.get("auto_breaker", True),
+        "threshold": KILL_SWITCH_CONFIG.get("threshold", -0.03),
+        "latch": KILL_SWITCH_CONFIG.get("latch", False),
+    }), 200
 
 
 @app.route('/api/order', methods=['POST'])
 @require_apikey
 def place_order():
-    if GLOBAL_TRADING_HALTED:
-        return jsonify({"status": "rejected", "message": "Global Kill Switch is Active"}), 403
-
     data = request.json or {}
     broker = data.get('broker', 'shadow').lower()
     ticker = data.get('ticker', '').upper()
     side = data.get('side', '').upper()
+
+    # The kill switch blocks NEW RISK only. Exits (SELL) always go through: a panic
+    # button that also freezes stop-outs turns a bad hour into a bad day, because the
+    # losing positions can never be closed.
+    if kill_switch_blocks(side):
+        return jsonify({
+            "status": "rejected",
+            "message": "Global Kill Switch is Active (new entries blocked; exits allowed)",
+            "reason": "GLOBAL_KILL_SWITCH",
+        }), 403
     qty = float(data.get('qty', 0))
     limit_price = float(data.get('limit_price', 0))
     agent_id = data.get('agent_id', 'macro_fleet')
@@ -1116,28 +1261,36 @@ def trade_lifecycle_daemon():
             now_edt = datetime.now(MARKET_TZ)
             current_time_str = now_edt.strftime("%H:%M")
 
-            # Daily Drawdown Circuit Breaker Check (-3.0%)
+            # Daily Drawdown Circuit Breaker — blocks NEW ENTRIES only.
+            # Exits are never blocked, so a drawdown can always be de-risked.
             if now_ts - last_circuit_breaker_check >= 60.0 and not GLOBAL_TRADING_HALTED:
                 last_circuit_breaker_check = now_ts
-                for acct_id, client in ALPACA_ACCOUNTS.items():
-                    try:
-                        acct_info = client.get_account()
-                        eq = float(acct_info.equity)
-                        last_eq = float(acct_info.last_equity)
-                        if last_eq > 0:
-                            daily_dd = (eq - last_eq) / last_eq
-                            if daily_dd <= -0.03:
-                                GLOBAL_TRADING_HALTED = True
-                                alert_msg = (
-                                    f"🚨 <b>[AUTOMATIC CIRCUIT BREAKER TRIPPED]</b>\n"
-                                    f"Account <code>{acct_id}</code> breached -3.0% daily drawdown: <b>{daily_dd*100:.2f}%</b>\n"
-                                    f"All fleet order entry is now <b>HALTED</b>."
-                                )
-                                print(f"[OMS] {alert_msg}")
-                                send_oms_telegram_alert(alert_msg)
-                                break
-                    except Exception:
-                        pass
+                threshold = float(KILL_SWITCH_CONFIG.get("threshold", -0.03))
+                auto_breaker = bool(KILL_SWITCH_CONFIG.get("auto_breaker", True))
+                latched = bool(KILL_SWITCH_CONFIG.get("latch", False))
+                worst = _current_daily_dd()
+                if worst is not None:
+                    _acct_id, daily_dd, _eq, _last_eq = worst
+                    if latched:
+                        # Manual override in force. Release it automatically once the
+                        # drawdown has recovered, so the protection comes back on its own.
+                        if daily_dd > threshold:
+                            KILL_SWITCH_CONFIG["latch"] = False
+                            save_kill_switch_config()
+                            print(f"[OMS] Daily drawdown recovered to {daily_dd*100:.2f}% — manual latch released, "
+                                  f"automatic circuit breaker re-armed.")
+                            send_oms_telegram_alert(
+                                f"✅ <b>[GATEWAY OMS]</b> Daily drawdown recovered to {daily_dd*100:.2f}% — "
+                                f"manual latch released, automatic circuit breaker re-armed.")
+                    elif auto_breaker and daily_dd <= threshold:
+                        GLOBAL_TRADING_HALTED = True
+                        alert_msg = (
+                            f"🚨 <b>[AUTOMATIC CIRCUIT BREAKER TRIPPED]</b>\n"
+                            f"Account <code>{_acct_id}</code> breached {threshold*100:.2f}% daily drawdown: <b>{daily_dd*100:.2f}%</b>\n"
+                            f"New entries are <b>HALTED</b>. Exits (stop-outs, flattens) are still allowed."
+                        )
+                        print(f"[OMS] {alert_msg}")
+                        send_oms_telegram_alert(alert_msg)
 
             with db_lock:
                 conn = get_db_connection()
